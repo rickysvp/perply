@@ -35,12 +35,12 @@ contract PerplyArenaTest is Test {
             uint256 totalRequired
         ) = arena.previewOpen(LONG, 1 ether, 10);
 
-        assertEq(openFee, 0.01 ether, "open fee must be 1%");
+        assertEq(openFee, 0.005 ether, "open fee must be 0.5%");
         assertEq(congestionRate, 0, "congestion must be zero for balanced side");
         assertEq(congestionFee, 0, "congestion fee must be zero");
         assertEq(congestionToOpposite, 0, "opposite split must be zero");
         assertEq(congestionToTreasury, 0, "treasury split must be zero");
-        assertEq(totalRequired, 1.01 ether, "total required mismatch");
+        assertEq(totalRequired, 1.005 ether, "total required mismatch");
 
         _open(alice, LONG, 1 ether, 10);
 
@@ -79,7 +79,7 @@ contract PerplyArenaTest is Test {
             "available balance should include open and congestion fees"
         );
 
-        uint256 expectedTreasury = 0.04058 ether;
+        uint256 expectedTreasury = 0.02058 ether;
         assertEq(arena.treasuryBalance(), expectedTreasury, "treasury amount mismatch");
         assertEq(
             arena.cumulativeCongestionRewards(SHORT),
@@ -122,7 +122,7 @@ contract PerplyArenaTest is Test {
         assertEq(shortPos.pnl, -int256(expectedGross), "short side pnl mismatch");
     }
 
-    function testCloseFeeIsOnePercentOfPositiveEquity() public {
+    function testCloseFeeIsHalfPercentOfPositiveEquity() public {
         _deposit(alice, 10 ether);
         _open(alice, LONG, 1 ether, 10);
 
@@ -144,7 +144,7 @@ contract PerplyArenaTest is Test {
         assertEq(
             arena.treasuryBalance() - treasuryBefore,
             expectedCloseFee,
-            "close fee should equal 1% of positive equity"
+            "close fee should equal 0.5% of positive equity"
         );
 
         PerplyArena.PositionView memory closed = arena.getPosition(alice, LONG);

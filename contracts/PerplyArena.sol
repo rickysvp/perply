@@ -153,8 +153,8 @@ contract PerplyArena {
         settlementStrengthBps = 8000; // k = 0.8
         maxSettlementTransferBps = 3000; // max 30% of losing side margin per tick
 
-        openFeeBps = 100; // 1%
-        closeFeeBps = 100; // 1%
+        openFeeBps = 50; // 0.5%
+        closeFeeBps = 50; // 0.5%
         settlementFeeBps = 1; // 0.01%
 
         congestionStartBps = 1000; // starts when imbalance >10%

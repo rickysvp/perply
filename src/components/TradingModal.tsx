@@ -68,7 +68,7 @@ export default function TradingModal({
   if (!isOpen) return null;
 
   const positionSize = margin * leverage;
-  const fallbackOpenFee = margin * 0.01;
+  const fallbackOpenFee = margin * 0.005;
   const openFee = preview?.openFee ?? fallbackOpenFee;
   const congestionFee = preview?.congestionFee ?? 0;
   const congestionToOpposite = preview?.congestionToOpposite ?? 0;
@@ -173,7 +173,7 @@ export default function TradingModal({
             <div className="flex justify-between items-center text-[10px]">
               <span className="text-zinc-500 font-bold uppercase tracking-wider flex items-center">
                 <Info size={10} className="mr-1.5 text-neon-blue" />
-                Open Fee (1.00%)
+                Open Fee (0.50%)
               </span>
               <span className="text-zinc-400 font-mono font-bold">{openFee.toFixed(4)} $MON</span>
             </div>
@@ -201,7 +201,7 @@ export default function TradingModal({
             </div>
 
             <div className="text-[9px] text-zinc-500 font-mono leading-relaxed">
-              Congestion surcharge is paid by crowded-side entries. 80% is distributed to the opposite camp.
+              Congestion surcharge is paid by crowded-side entries. 80% is distributed to the opposite camp. Close fee is 0.50% on positive equity; settlement fee is 0.01% on winner-side transfer.
             </div>
           </div>
         </div>

@@ -65,14 +65,15 @@ npm run dev
 
 ## V1.1 Rules Implemented
 
-1. Open fee `1.0%`
-2. Close fee `1.0%`
+1. Open fee `0.5%`
+2. Close fee `0.5%`
 3. Settlement fee `0.01%` per tick
 4. Dynamic congestion surcharge on crowded side
 5. Congestion surcharge split: `80%` to opposite camp, `20%` to treasury
 6. Tick settlement: `10s` interval + early trigger when volatility threshold reached
 7. Liquidation mechanism with maintenance margin and liquidation penalty
 8. Frontend fee preview before placing bet (includes congestion surcharge and opponent reward)
+9. Fee treasury reserved for future liquidity-pool subsidy programs
 
 ## V1.1 Source Aggregation
 
