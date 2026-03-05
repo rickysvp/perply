@@ -40,6 +40,21 @@ export interface WalletProvider {
   request: (args: { method: string; params?: unknown[] | Record<string, unknown> }) => Promise<unknown>;
   on?: (event: string, listener: (...args: unknown[]) => void) => void;
   removeListener?: (event: string, listener: (...args: unknown[]) => void) => void;
+  isMetaMask?: boolean;
+  isOKExWallet?: boolean;
+  isOkxWallet?: boolean;
+  isRabby?: boolean;
+  isBackpack?: boolean;
+  isPhantom?: boolean;
+  providers?: WalletProvider[];
+}
+
+export interface DiscoveredWallet {
+  id: string;
+  name: string;
+  provider: WalletProvider;
+  rdns?: string;
+  icon?: string;
 }
 
 export interface ArenaPositionRaw {
@@ -56,6 +71,120 @@ export interface ArenaPositionRaw {
 export function getEthereumProvider(): WalletProvider | null {
   if (typeof window === 'undefined') return null;
   return (window as Window & { ethereum?: WalletProvider }).ethereum ?? null;
+}
+
+function classifyWalletName(provider: WalletProvider, hint?: string): string {
+  const text = (hint ?? '').toLowerCase();
+  if (provider.isRabby || text.includes('rabby')) return 'Rabby';
+  if (provider.isOKExWallet || provider.isOkxWallet || text.includes('okx')) return 'OKX Wallet';
+  if (provider.isBackpack || text.includes('backpack')) return 'Backpack';
+  if (provider.isPhantom || text.includes('phantom')) return 'Phantom';
+  if (provider.isMetaMask || text.includes('metamask')) return 'MetaMask';
+  return hint?.trim() || 'EVM Wallet';
+}
+
+function walletPriority(name: string): number {
+  const normalized = name.toLowerCase();
+  if (normalized.includes('metamask')) return 0;
+  if (normalized.includes('okx')) return 1;
+  if (normalized.includes('rabby')) return 2;
+  if (normalized.includes('backpack')) return 3;
+  if (normalized.includes('phantom')) return 4;
+  return 50;
+}
+
+function isWalletProvider(value: unknown): value is WalletProvider {
+  return Boolean(value) && typeof (value as WalletProvider).request === 'function';
+}
+
+export function inferWalletName(provider: WalletProvider | null): string {
+  if (!provider) return 'Wallet';
+  return classifyWalletName(provider);
+}
+
+export async function discoverWallets(timeoutMs = 220): Promise<DiscoveredWallet[]> {
+  if (typeof window === 'undefined') return [];
+
+  const wallets: DiscoveredWallet[] = [];
+  const seen = new WeakSet<object>();
+  const usedIds = new Set<string>();
+
+  const addWallet = (
+    provider: unknown,
+    meta?: {
+      name?: string;
+      rdns?: string;
+      icon?: string;
+      uuid?: string;
+    }
+  ) => {
+    if (!isWalletProvider(provider)) return;
+    if (seen.has(provider as object)) return;
+
+    seen.add(provider as object);
+    const name = classifyWalletName(provider, meta?.name);
+    const baseIdRaw = meta?.uuid || meta?.rdns || name;
+    const baseId = baseIdRaw.toLowerCase().replace(/[^a-z0-9-_.]+/g, '-');
+    let id = baseId;
+    let i = 1;
+    while (usedIds.has(id)) {
+      i += 1;
+      id = `${baseId}-${i}`;
+    }
+    usedIds.add(id);
+
+    wallets.push({
+      id,
+      name,
+      provider,
+      rdns: meta?.rdns,
+      icon: meta?.icon
+    });
+  };
+
+  const eip6963Handler = (event: Event) => {
+    const detail = (event as CustomEvent).detail as
+      | {
+          info?: { name?: string; rdns?: string; icon?: string; uuid?: string };
+          provider?: WalletProvider;
+        }
+      | undefined;
+    addWallet(detail?.provider, detail?.info);
+  };
+
+  window.addEventListener('eip6963:announceProvider', eip6963Handler as EventListener);
+  window.dispatchEvent(new Event('eip6963:requestProvider'));
+
+  await new Promise(resolve => window.setTimeout(resolve, timeoutMs));
+  window.removeEventListener('eip6963:announceProvider', eip6963Handler as EventListener);
+
+  const w = window as Window & {
+    ethereum?: WalletProvider;
+    okxwallet?: { ethereum?: WalletProvider };
+    rabby?: { ethereum?: WalletProvider };
+    backpack?: { ethereum?: WalletProvider };
+    phantom?: { ethereum?: WalletProvider };
+  };
+
+  const maybeEthereum = w.ethereum;
+  if (maybeEthereum?.providers && Array.isArray(maybeEthereum.providers)) {
+    for (const provider of maybeEthereum.providers) {
+      addWallet(provider);
+    }
+  }
+  addWallet(maybeEthereum);
+  addWallet(w.okxwallet?.ethereum, { name: 'OKX Wallet', rdns: 'com.okex.wallet' });
+  addWallet(w.rabby?.ethereum, { name: 'Rabby', rdns: 'io.rabby' });
+  addWallet(w.backpack?.ethereum, { name: 'Backpack', rdns: 'io.backpack' });
+  addWallet(w.phantom?.ethereum, { name: 'Phantom', rdns: 'app.phantom' });
+
+  wallets.sort((a, b) => {
+    const p = walletPriority(a.name) - walletPriority(b.name);
+    if (p !== 0) return p;
+    return a.name.localeCompare(b.name);
+  });
+
+  return wallets;
 }
 
 export function getArenaAddress(): string | null {

@@ -12,12 +12,16 @@ import TradingModal from './components/TradingModal';
 
 import { BattleRecord, UserPositions, Position } from './types';
 import {
+  discoverWallets,
+  DiscoveredWallet,
   ensureMonadTestnet,
   fromPriceE8,
   getArenaAddress,
   getEthereumProvider,
+  inferWalletName,
   MONAD_TESTNET,
   PERPLY_ARENA_ABI,
+  WalletProvider,
   shortenAddress,
   toPriceE8
 } from './web3/perplyArena';
@@ -163,6 +167,10 @@ export default function App() {
   const [battleHistory, setBattleHistory] = useState<BattleRecord[]>([]);
   const [isGlitching, setIsGlitching] = useState(false);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [walletProvider, setWalletProvider] = useState<WalletProvider | null>(null);
+  const [connectedWalletName, setConnectedWalletName] = useState<string | null>(null);
+  const [walletOptions, setWalletOptions] = useState<DiscoveredWallet[]>([]);
+  const [isWalletPickerOpen, setIsWalletPickerOpen] = useState(false);
   const [walletError, setWalletError] = useState<string | null>(null);
   const [priceFeedStatus, setPriceFeedStatus] = useState<'live' | 'degraded'>('live');
   const [isTxPending, setIsTxPending] = useState(false);
@@ -192,6 +200,7 @@ export default function App() {
   const isContractConfigured = Boolean(arenaAddress);
   const isWalletConnected = walletAddress !== null;
   const walletLabel = shortenAddress(walletAddress);
+  const connectedWalletLabel = connectedWalletName ?? 'Wallet';
   const isKeeperAuthorized = useMemo(() => {
     if (!walletAddress) return false;
     const addr = walletAddress.toLowerCase();
@@ -355,7 +364,7 @@ export default function App() {
   };
 
   const getWriteContract = async () => {
-    const provider = getEthereumProvider();
+    const provider = walletProvider ?? getEthereumProvider();
     if (!provider) throw new Error('Wallet provider not found');
     if (!arenaAddress) throw new Error('Missing VITE_PERPLY_ARENA_ADDRESS');
     await ensureMonadTestnet(provider);
@@ -463,10 +472,10 @@ export default function App() {
     }
   };
 
-  const connectWallet = async () => {
-    const provider = getEthereumProvider();
+  const connectWallet = async (providerOverride?: WalletProvider, walletNameOverride?: string) => {
+    const provider = providerOverride ?? walletProvider ?? getEthereumProvider();
     if (!provider) {
-      setWalletError('MetaMask not detected');
+      setWalletError('No EVM wallet detected. Install MetaMask / OKX / Rabby / Backpack / Phantom');
       return;
     }
     if (!isContractConfigured) {
@@ -482,8 +491,11 @@ export default function App() {
         return;
       }
 
+      setWalletProvider(provider);
+      setConnectedWalletName(walletNameOverride ?? inferWalletName(provider));
       setWalletAddress(accounts[0]);
       setWalletError(null);
+      setIsWalletPickerOpen(false);
       setShowWalletMenu(false);
       await refreshOnchainState(accounts[0]);
     } catch (error) {
@@ -503,7 +515,7 @@ export default function App() {
 
     try {
       setIsTxPending(true);
-      const provider = getEthereumProvider();
+      const provider = walletProvider ?? getEthereumProvider();
       if (!provider) throw new Error('Wallet provider not found');
       const browserProvider = new ethers.BrowserProvider(provider);
       const signer = await browserProvider.getSigner();
@@ -574,26 +586,55 @@ export default function App() {
     }
   };
 
+  const loadWalletOptions = async (): Promise<DiscoveredWallet[]> => {
+    const wallets = await discoverWallets();
+    setWalletOptions(wallets);
+    return wallets;
+  };
+
+  const openWalletPicker = async () => {
+    const wallets = await loadWalletOptions();
+    if (wallets.length === 0) {
+      setWalletError('No EVM wallet detected. Install MetaMask / OKX / Rabby / Backpack / Phantom');
+      return;
+    }
+    setWalletError(null);
+    setIsWalletPickerOpen(true);
+  };
+
   // Detect wallet session on load
   useEffect(() => {
-    const provider = getEthereumProvider();
-    if (!provider) return;
-    provider.request({ method: 'eth_accounts' })
-      .then(result => {
-        const accounts = Array.isArray(result) ? result as string[] : [];
-        if (accounts.length > 0) {
-          setWalletAddress(accounts[0]);
-          void refreshOnchainState(accounts[0]);
+    let active = true;
+    const detect = async () => {
+      const wallets = await discoverWallets();
+      if (!active) return;
+      setWalletOptions(wallets);
+      for (const wallet of wallets) {
+        try {
+          const result = await wallet.provider.request({ method: 'eth_accounts' });
+          const accounts = Array.isArray(result) ? result as string[] : [];
+          if (accounts.length > 0) {
+            setWalletProvider(wallet.provider);
+            setConnectedWalletName(wallet.name);
+            setWalletAddress(accounts[0]);
+            setWalletError(null);
+            void refreshOnchainState(accounts[0]);
+            break;
+          }
+        } catch {
+          // ignore passive wallet detection errors
         }
-      })
-      .catch(() => {
-        // ignore passive wallet detection errors
-      });
+      }
+    };
+    void detect();
+    return () => {
+      active = false;
+    };
   }, []);
 
   // Track wallet account and network switching from provider events.
   useEffect(() => {
-    const provider = getEthereumProvider();
+    const provider = walletProvider;
     if (!provider?.on) return;
 
     const onAccountsChanged = (...args: unknown[]) => {
@@ -622,7 +663,7 @@ export default function App() {
       provider.removeListener?.('accountsChanged', onAccountsChanged);
       provider.removeListener?.('chainChanged', onChainChanged);
     };
-  }, [walletAddress]);
+  }, [walletProvider, walletAddress]);
 
   // Live market data loop (Binance / Pyth / Chainlink / CoinGecko aggregate)
   useEffect(() => {
@@ -770,7 +811,7 @@ export default function App() {
 
   const handleWalletClick = () => {
     if (!isWalletConnected) {
-      void connectWallet();
+      void openWalletPicker();
       return;
     }
     setShowWalletMenu(prev => !prev);
@@ -778,7 +819,10 @@ export default function App() {
 
   const handleDisconnect = () => {
     setWalletAddress(null);
+    setWalletProvider(null);
+    setConnectedWalletName(null);
     setWalletError(null);
+    setIsWalletPickerOpen(false);
     setShowWalletMenu(false);
     setIsAutoKeeperEnabled(false);
     setUserBalance(DEFAULT_BALANCE);
@@ -787,7 +831,7 @@ export default function App() {
 
   const handleBet = async (side: 'long' | 'short') => {
     if (!isWalletConnected) {
-      void connectWallet();
+      void openWalletPicker();
       return;
     }
     if (!isContractConfigured) {
@@ -988,6 +1032,27 @@ export default function App() {
                     Missing VITE_PERPLY_ARENA_ADDRESS
                   </div>
                 )}
+                {!isWalletConnected && isWalletPickerOpen && (
+                  <div className="absolute right-0 top-full mt-3 w-72 bg-black/95 border border-white/10 rounded-sm shadow-[0_20px_50px_rgba(0,0,0,0.8)] z-50 overflow-hidden backdrop-blur-2xl pointer-events-auto">
+                    <div className="px-4 py-3 border-b border-white/5 bg-white/5">
+                      <div className="text-[9px] text-zinc-400 uppercase tracking-[0.2em] font-bold">Select Wallet</div>
+                    </div>
+                    <div className="p-2 space-y-1">
+                      {walletOptions.map(wallet => (
+                        <button
+                          key={wallet.id}
+                          onClick={() => void connectWallet(wallet.provider, wallet.name)}
+                          className="w-full flex items-center justify-between px-3 py-2 rounded-sm hover:bg-white/10 border border-transparent hover:border-white/10 transition-all"
+                        >
+                          <span className="text-[10px] text-white font-bold uppercase tracking-wider">{wallet.name}</span>
+                          <span className="text-[8px] text-zinc-500 font-mono">
+                            {wallet.rdns ? wallet.rdns.split('.').slice(-2).join('.') : 'Injected'}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* Wallet Dropdown */}
                 {isWalletConnected && showWalletMenu && (
@@ -999,6 +1064,7 @@ export default function App() {
                         </div>
                         <div>
                           <div className="text-[10px] text-white font-bold tracking-wider">{walletLabel}</div>
+                          <div className="text-[8px] text-zinc-500 uppercase tracking-wider">{connectedWalletLabel}</div>
                           <div className="text-[8px] text-neon-green uppercase font-bold tracking-widest flex items-center">
                             <span className="w-1 h-1 bg-neon-green rounded-full mr-1 animate-pulse"></span>
                             Connected
