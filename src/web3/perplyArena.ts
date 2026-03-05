@@ -14,7 +14,12 @@ export const MONAD_TESTNET = {
 } as const;
 
 export const PERPLY_ARENA_ABI = [
+  'function owner() view returns (address)',
+  'function keeper() view returns (address)',
   'function markPriceE8() view returns (uint256)',
+  'function lastSettlementAt() view returns (uint256)',
+  'function minSettlementInterval() view returns (uint32)',
+  'function volatilityTriggerBps() view returns (uint16)',
   'function availableBalance(address) view returns (uint256)',
   'function getPosition(address trader, uint8 side) view returns (tuple(uint256 margin, uint256 weight, uint32 leverage, uint64 entryPriceE8, bool isOpen, int256 pnl, int256 equity, uint256 maintenanceMargin))',
   'function getCongestionRatesBps() view returns (uint16 longRate, uint16 shortRate)',
@@ -26,6 +31,7 @@ export const PERPLY_ARENA_ABI = [
   'function openPosition(uint8 side, uint256 margin, uint32 leverage)',
   'function closePosition(uint8 side)',
   'function settleWithPrice(uint256 newPriceE8)',
+  'event Settled(uint256 oldPriceE8, uint256 newPriceE8, uint8 winnerSide, uint8 loserSide, uint256 grossTransfer, uint256 settlementFee, uint256 winnerNet, uint256 matchedWeight)',
   'event PositionOpened(address indexed trader, uint8 indexed side, uint256 margin, uint32 leverage, uint256 weight, uint256 openFee, uint16 congestionRateBps, uint256 congestionFee, uint256 congestionToOpposite, uint256 congestionToTreasury)',
   'event PositionClosed(address indexed trader, uint8 indexed side, uint256 margin, uint256 weight, uint32 leverage, int256 pnl, int256 equityBeforeFees, uint256 closeFee, uint256 payout)'
 ] as const;

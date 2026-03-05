@@ -42,6 +42,27 @@ interface OpenPreview {
   totalRequired: number;
 }
 
+interface SettlementRow {
+  id: string;
+  time: string;
+  direction: 'up' | 'down' | 'flat';
+  winner: 'LONG' | 'SHORT' | 'NONE';
+  grossTransfer: number;
+  winnerNet: number;
+  settlementFee: number;
+}
+
+interface CongestionRow {
+  id: string;
+  time: string;
+  trader: string;
+  side: 'LONG' | 'SHORT';
+  congestionRate: number;
+  congestionFee: number;
+  toOpposite: number;
+  toTreasury: number;
+}
+
 async function fetchBinancePrice(): Promise<number | null> {
   try {
     const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
@@ -150,6 +171,14 @@ export default function App() {
   const [shortCongestionRateBps, setShortCongestionRateBps] = useState(0);
   const [longCongestionRewards, setLongCongestionRewards] = useState(0);
   const [shortCongestionRewards, setShortCongestionRewards] = useState(0);
+  const [contractOwner, setContractOwner] = useState<string | null>(null);
+  const [contractKeeper, setContractKeeper] = useState<string | null>(null);
+  const [minSettlementIntervalSec, setMinSettlementIntervalSec] = useState(10);
+  const [volatilityTriggerPct, setVolatilityTriggerPct] = useState(0.15);
+  const [lastSettlementAt, setLastSettlementAt] = useState<number | null>(null);
+  const [isAutoKeeperEnabled, setIsAutoKeeperEnabled] = useState(false);
+  const [recentSettlements, setRecentSettlements] = useState<SettlementRow[]>([]);
+  const [recentCongestionFees, setRecentCongestionFees] = useState<CongestionRow[]>([]);
   const [showWalletMenu, setShowWalletMenu] = useState(false);
   const [isTradingModalOpen, setIsTradingModalOpen] = useState(false);
   const [tradingSide, setTradingSide] = useState<'long' | 'short'>('long');
@@ -163,9 +192,79 @@ export default function App() {
   const isContractConfigured = Boolean(arenaAddress);
   const isWalletConnected = walletAddress !== null;
   const walletLabel = shortenAddress(walletAddress);
+  const isKeeperAuthorized = useMemo(() => {
+    if (!walletAddress) return false;
+    const addr = walletAddress.toLowerCase();
+    return addr === contractOwner?.toLowerCase() || addr === contractKeeper?.toLowerCase();
+  }, [walletAddress, contractOwner, contractKeeper]);
 
   const formatCurrency = (val: number) => {
     return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(val);
+  };
+
+  const formatTimestamp = (timestampSec: number): string => {
+    return new Date(timestampSec * 1000).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+  };
+
+  const refreshArenaHistory = async (provider: ethers.JsonRpcProvider, contract: ethers.Contract) => {
+    try {
+      const latestBlock = await provider.getBlockNumber();
+      const fromBlock = latestBlock > 2000 ? latestBlock - 2000 : 0;
+
+      const [settledLogs, openLogs] = await Promise.all([
+        contract.queryFilter(contract.filters.Settled(), fromBlock, latestBlock),
+        contract.queryFilter(contract.filters.PositionOpened(), fromBlock, latestBlock)
+      ]);
+
+      const settlementRows: SettlementRow[] = settledLogs.slice(-12).reverse().map((log: any) => {
+        const args = log.args;
+        const oldPrice = Number(args.oldPriceE8 ?? args[0]) / 1e8;
+        const newPrice = Number(args.newPriceE8 ?? args[1]) / 1e8;
+        const direction: 'up' | 'down' | 'flat' = newPrice > oldPrice ? 'up' : (newPrice < oldPrice ? 'down' : 'flat');
+        const winnerSide = Number(args.winnerSide ?? args[2]);
+        const winner = winnerSide === 0 ? 'LONG' : winnerSide === 1 ? 'SHORT' : 'NONE';
+        const blockTime = Number((log as any).blockTimestamp ?? 0);
+
+        return {
+          id: `${log.blockNumber}-${log.index}`,
+          time: blockTime > 0 ? formatTimestamp(blockTime) : `${log.blockNumber}`,
+          direction,
+          winner,
+          grossTransfer: Number(ethers.formatEther(args.grossTransfer ?? args[4])),
+          winnerNet: Number(ethers.formatEther(args.winnerNet ?? args[6])),
+          settlementFee: Number(ethers.formatEther(args.settlementFee ?? args[5]))
+        };
+      });
+
+      const congestionRows: CongestionRow[] = openLogs
+        .filter((log: any) => Number(log.args?.congestionFee ?? log.args?.[7] ?? 0) > 0)
+        .slice(-12)
+        .reverse()
+        .map((log: any) => {
+          const args = log.args;
+          const side = Number(args.side ?? args[1]) === 0 ? 'LONG' : 'SHORT';
+          const blockTime = Number((log as any).blockTimestamp ?? 0);
+          return {
+            id: `${log.blockNumber}-${log.index}`,
+            time: blockTime > 0 ? formatTimestamp(blockTime) : `${log.blockNumber}`,
+            trader: shortenAddress(args.trader ?? args[0]),
+            side,
+            congestionRate: Number(args.congestionRateBps ?? args[6]) / 100,
+            congestionFee: Number(ethers.formatEther(args.congestionFee ?? args[7])),
+            toOpposite: Number(ethers.formatEther(args.congestionToOpposite ?? args[8])),
+            toTreasury: Number(ethers.formatEther(args.congestionToTreasury ?? args[9]))
+          };
+        });
+
+      setRecentSettlements(settlementRows);
+      setRecentCongestionFees(congestionRows);
+    } catch {
+      // event read is best-effort for dashboard visibility
+    }
   };
 
   // Calculate unrealized PnL for a position
@@ -242,6 +341,11 @@ export default function App() {
       setShortCongestionRateBps(0);
       setLongCongestionRewards(0);
       setShortCongestionRewards(0);
+      setContractOwner(null);
+      setContractKeeper(null);
+      setLastSettlementAt(null);
+      setRecentSettlements([]);
+      setRecentCongestionFees([]);
       return;
     }
     const trader = addressOverride ?? walletAddress ?? ethers.ZeroAddress;
@@ -250,6 +354,11 @@ export default function App() {
       const readProvider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
       const readContract = new ethers.Contract(arenaAddress, PERPLY_ARENA_ABI, readProvider);
       const [
+        owner,
+        keeper,
+        lastSettle,
+        minInterval,
+        volTriggerBps,
         available,
         longPos,
         shortPos,
@@ -260,6 +369,11 @@ export default function App() {
         longWeight,
         shortWeight
       ] = await Promise.all([
+        readContract.owner() as Promise<string>,
+        readContract.keeper() as Promise<string>,
+        readContract.lastSettlementAt() as Promise<bigint>,
+        readContract.minSettlementInterval() as Promise<bigint>,
+        readContract.volatilityTriggerBps() as Promise<bigint>,
         readContract.availableBalance(trader) as Promise<bigint>,
         readContract.getPosition(trader, 0) as Promise<{
           margin: bigint;
@@ -294,6 +408,11 @@ export default function App() {
         long: mapOnchainPosition(longPos, 'long'),
         short: mapOnchainPosition(shortPos, 'short')
       });
+      setContractOwner(owner);
+      setContractKeeper(keeper);
+      setLastSettlementAt(Number(lastSettle));
+      setMinSettlementIntervalSec(Number(minInterval));
+      setVolatilityTriggerPct(Number(volTriggerBps) / 100);
       setOnchainMarkPrice(fromPriceE8(markPrice));
       setLongCongestionRateBps(Number(congestionRates[0]));
       setShortCongestionRateBps(Number(congestionRates[1]));
@@ -301,6 +420,7 @@ export default function App() {
       setShortCongestionRewards(Number(ethers.formatEther(shortRewards)));
       setAllianceLiquidity(Number(ethers.formatEther(longWeight)));
       setSyndicateLiquidity(Number(ethers.formatEther(shortWeight)));
+      await refreshArenaHistory(readProvider, readContract);
       setWalletError(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to load on-chain state';
@@ -383,6 +503,10 @@ export default function App() {
 
   const handleSyncOnchainPrice = async () => {
     if (!isWalletConnected) return;
+    if (!isKeeperAuthorized) {
+      setWalletError('Connected wallet is not owner/keeper');
+      return;
+    }
     try {
       setIsTxPending(true);
       const contract = await getWriteContract();
@@ -523,6 +647,39 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [walletAddress, arenaAddress]);
 
+  useEffect(() => {
+    if (!isAutoKeeperEnabled) return;
+    if (!isWalletConnected || !isKeeperAuthorized || !isContractConfigured) return;
+
+    const interval = window.setInterval(() => {
+      if (isTxPending) return;
+      if (!onchainMarkPrice || !Number.isFinite(onchainMarkPrice) || onchainMarkPrice <= 0) return;
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const elapsed = lastSettlementAt ? nowSec - lastSettlementAt : Number.MAX_SAFE_INTEGER;
+      const deltaPct = Math.abs(price - onchainMarkPrice) / onchainMarkPrice * 100;
+      const meetsTime = elapsed >= minSettlementIntervalSec;
+      const meetsVol = deltaPct >= volatilityTriggerPct;
+
+      if (meetsTime || meetsVol) {
+        void handleSyncOnchainPrice();
+      }
+    }, 2000);
+
+    return () => window.clearInterval(interval);
+  }, [
+    isAutoKeeperEnabled,
+    isWalletConnected,
+    isKeeperAuthorized,
+    isContractConfigured,
+    isTxPending,
+    onchainMarkPrice,
+    price,
+    lastSettlementAt,
+    minSettlementIntervalSec,
+    volatilityTriggerPct
+  ]);
+
   const getOpenPreview = async (side: 'long' | 'short', margin: number, leverage: number): Promise<OpenPreview | null> => {
     if (!arenaAddress || margin <= 0 || leverage <= 0) return null;
     try {
@@ -570,6 +727,7 @@ export default function App() {
     setWalletAddress(null);
     setWalletError(null);
     setShowWalletMenu(false);
+    setIsAutoKeeperEnabled(false);
     setUserBalance(DEFAULT_BALANCE);
     setUserPositions({ long: null, short: null });
   };
@@ -792,6 +950,9 @@ export default function App() {
                             <span className="w-1 h-1 bg-neon-green rounded-full mr-1 animate-pulse"></span>
                             Connected
                           </div>
+                          <div className="text-[7px] text-zinc-500 mt-1 font-mono">
+                            Owner: {contractOwner ? shortenAddress(contractOwner) : 'N/A'} | Keeper: {contractKeeper ? shortenAddress(contractKeeper) : 'N/A'}
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -841,10 +1002,17 @@ export default function App() {
                       </button>
                       <button
                         onClick={handleSyncOnchainPrice}
-                        disabled={isTxPending}
+                        disabled={isTxPending || !isKeeperAuthorized}
                         className="w-full py-2 bg-neon-green/10 hover:bg-neon-green/20 border border-neon-green/30 rounded-sm text-[9px] text-neon-green font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                       >
                         Run Settlement Tick
+                      </button>
+                      <button
+                        onClick={() => setIsAutoKeeperEnabled(prev => !prev)}
+                        disabled={isTxPending || !isKeeperAuthorized}
+                        className="w-full py-2 bg-neon-yellow/10 hover:bg-neon-yellow/20 border border-neon-yellow/30 rounded-sm text-[9px] text-neon-yellow font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                      >
+                        {isAutoKeeperEnabled ? 'Auto Keeper: ON' : 'Auto Keeper: OFF'}
                       </button>
                       <button
                         onClick={handleDisconnect}
@@ -954,6 +1122,9 @@ export default function App() {
                 <div className="mt-2 text-[8px] text-zinc-400 font-mono tracking-wider z-10">
                   On-chain Mark: {onchainMarkPrice ? formatCurrency(onchainMarkPrice) : 'N/A'}
                 </div>
+                <div className="mt-1 text-[8px] text-zinc-500 font-mono tracking-wider z-10">
+                  Tick: {minSettlementIntervalSec}s | Trigger: {volatilityTriggerPct.toFixed(2)}% | Keeper: {isAutoKeeperEnabled ? 'AUTO' : 'MANUAL'}
+                </div>
               </div>
 
               {/* Betting Controls */}
@@ -1026,6 +1197,66 @@ export default function App() {
                       ))
                     )}
                   </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Keeper & Fee Dashboard */}
+            <div className="absolute right-6 bottom-10 z-30 w-[320px] hidden xl:block">
+              <div className="bg-black/70 border border-white/10 backdrop-blur-md rounded-lg p-3 space-y-3 shadow-[0_0_25px_rgba(0,0,0,0.5)]">
+                <div className="flex items-center justify-between">
+                  <span className="text-[9px] uppercase tracking-[0.2em] text-zinc-400 font-bold">Settlement Feed</span>
+                  <span className={`text-[8px] font-mono ${isAutoKeeperEnabled ? 'text-neon-green' : 'text-zinc-500'}`}>
+                    {isAutoKeeperEnabled ? 'AUTO' : 'MANUAL'}
+                  </span>
+                </div>
+                <div className="space-y-1 max-h-32 overflow-y-auto scrollbar-none">
+                  {recentSettlements.length === 0 ? (
+                    <div className="text-[8px] text-zinc-600 font-mono">No settlement events yet.</div>
+                  ) : recentSettlements.map(item => (
+                    <div key={item.id} className="border border-white/5 rounded p-1.5 text-[8px] font-mono bg-white/[0.02]">
+                      <div className="flex justify-between">
+                        <span className="text-zinc-500">{item.time}</span>
+                        <span className={item.direction === 'up' ? 'text-neon-green' : item.direction === 'down' ? 'text-crimson-red' : 'text-zinc-500'}>
+                          {item.direction.toUpperCase()}
+                        </span>
+                      </div>
+                      <div className="flex justify-between mt-0.5">
+                        <span className="text-zinc-400">Winner: {item.winner}</span>
+                        <span className="text-white">Net {item.winnerNet.toFixed(3)}</span>
+                      </div>
+                      <div className="flex justify-between text-zinc-500 mt-0.5">
+                        <span>Gross {item.grossTransfer.toFixed(3)}</span>
+                        <span>Fee {item.settlementFee.toFixed(4)}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="h-px bg-white/10"></div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-[9px] uppercase tracking-[0.2em] text-zinc-400 font-bold">Congestion Fee Feed</span>
+                </div>
+                <div className="space-y-1 max-h-32 overflow-y-auto scrollbar-none">
+                  {recentCongestionFees.length === 0 ? (
+                    <div className="text-[8px] text-zinc-600 font-mono">No congestion surcharge events yet.</div>
+                  ) : recentCongestionFees.map(item => (
+                    <div key={item.id} className="border border-white/5 rounded p-1.5 text-[8px] font-mono bg-white/[0.02]">
+                      <div className="flex justify-between">
+                        <span className="text-zinc-500">{item.time}</span>
+                        <span className={item.side === 'LONG' ? 'text-neon-green' : 'text-crimson-red'}>{item.side}</span>
+                      </div>
+                      <div className="flex justify-between mt-0.5">
+                        <span className="text-zinc-400">{item.trader}</span>
+                        <span className="text-zinc-300">{item.congestionRate.toFixed(2)}%</span>
+                      </div>
+                      <div className="flex justify-between mt-0.5">
+                        <span className="text-neon-green">Opp +{item.toOpposite.toFixed(4)}</span>
+                        <span className="text-zinc-400">Treasury {item.toTreasury.toFixed(4)}</span>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
