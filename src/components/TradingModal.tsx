@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { X, TrendingUp, TrendingDown, Info, Zap, ShieldAlert } from 'lucide-react';
+import React, { useState } from 'react';
+import { X, TrendingUp, TrendingDown, Info, Zap } from 'lucide-react';
 
 interface TradingModalProps {
   isOpen: boolean;
@@ -18,9 +18,10 @@ export default function TradingModal({ isOpen, onClose, side, currentPrice, user
 
   const positionSize = margin * leverage;
   const entryFee = positionSize * 0.001; // 0.1% fee
+  const exceedsBalance = margin + entryFee > userBalance;
 
   const handleConfirm = () => {
-    if (margin > userBalance) return;
+    if (margin <= 0 || exceedsBalance) return;
     onConfirm(margin, leverage);
     onClose();
   };
@@ -133,9 +134,9 @@ export default function TradingModal({ isOpen, onClose, side, currentPrice, user
         <div className="px-6 py-5 bg-white/5 border-t border-white/5">
           <button 
             onClick={handleConfirm}
-            disabled={margin > userBalance || margin <= 0}
+            disabled={exceedsBalance || margin <= 0}
             className={`w-full py-4 rounded-xl font-black uppercase tracking-[0.2em] transition-all duration-300 border-2 ${
-              margin > userBalance 
+              exceedsBalance 
               ? 'bg-zinc-800 text-zinc-500 border-transparent cursor-not-allowed'
               : side === 'long'
                 ? 'bg-neon-green text-black border-neon-green shadow-[0_0_30px_rgba(57,255,20,0.3)] hover:shadow-[0_0_50px_rgba(57,255,20,0.5)]'
@@ -143,7 +144,7 @@ export default function TradingModal({ isOpen, onClose, side, currentPrice, user
             }`}
             style={{ fontFamily: "'Bruno Ace SC', sans-serif" }}
           >
-            {margin > userBalance ? 'Insufficient Balance' : `Confirm ${side === 'long' ? 'Long' : 'Short'}`}
+            {exceedsBalance ? 'Insufficient Balance' : `Confirm ${side === 'long' ? 'Long' : 'Short'}`}
           </button>
         </div>
       </div>

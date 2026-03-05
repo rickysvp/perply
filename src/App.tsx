@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import React from 'react';
 import { Zap, Wallet, ChevronDown, ChevronUp, TrendingUp, TrendingDown } from 'lucide-react';
 import BattleCanvas from './components/BattleCanvas';
@@ -11,10 +11,58 @@ import TradingModal from './components/TradingModal';
 
 import { BattleRecord, UserPositions, Position } from './types';
 
+const DEFAULT_PRICE = 64289.40;
+const DEFAULT_BALANCE = 24592.40;
+const PRICE_HISTORY_POINTS = 40;
+const MARKET_POLL_MS = 3000;
+const TRADING_FEE_RATE = 0.001;
+
+interface WalletProvider {
+  request: (args: { method: string; params?: unknown[] | Record<string, unknown> }) => Promise<unknown>;
+  on?: (event: string, listener: (...args: unknown[]) => void) => void;
+  removeListener?: (event: string, listener: (...args: unknown[]) => void) => void;
+}
+
+function getEthereumProvider(): WalletProvider | null {
+  if (typeof window === 'undefined') return null;
+  const provider = (window as Window & { ethereum?: WalletProvider }).ethereum;
+  return provider ?? null;
+}
+
+function shortenAddress(address: string | null): string {
+  if (!address) return '';
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+async function fetchBtcPrice(): Promise<number | null> {
+  try {
+    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
+    if (res.ok) {
+      const data = await res.json() as { price?: string };
+      const price = Number(data.price);
+      if (Number.isFinite(price) && price > 0) return price;
+    }
+  } catch {
+    // Try fallback provider below.
+  }
+
+  try {
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
+    if (res.ok) {
+      const data = await res.json() as { bitcoin?: { usd?: number } };
+      const price = Number(data.bitcoin?.usd);
+      if (Number.isFinite(price) && price > 0) return price;
+    }
+  } catch {
+    // Return null to keep previous price when both providers fail.
+  }
+
+  return null;
+}
+
 export default function App() {
-  // Simulation State
-  const [price, setPrice] = useState(64289.40);
-  const [priceHistory, setPriceHistory] = useState<number[]>(Array(40).fill(64289.40));
+  const [price, setPrice] = useState(DEFAULT_PRICE);
+  const [priceHistory, setPriceHistory] = useState<number[]>(Array(PRICE_HISTORY_POINTS).fill(DEFAULT_PRICE));
   const [dominance, setDominance] = useState(0);
   const [allianceLiquidity, setAllianceLiquidity] = useState(1824042);
   const [syndicateLiquidity, setSyndicateLiquidity] = useState(2466962);
@@ -22,20 +70,47 @@ export default function App() {
   const [latestPnL, setLatestPnL] = useState<{ faction: 'left' | 'right'; amount: string } | null>(null);
   const [battleHistory, setBattleHistory] = useState<BattleRecord[]>([]);
   const [isGlitching, setIsGlitching] = useState(false);
-  const [isWalletConnected, setIsWalletConnected] = useState(false);
+  const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
+  const [priceFeedStatus, setPriceFeedStatus] = useState<'live' | 'degraded'>('live');
   const [showWalletMenu, setShowWalletMenu] = useState(false);
   const [isTradingModalOpen, setIsTradingModalOpen] = useState(false);
   const [tradingSide, setTradingSide] = useState<'long' | 'short'>('long');
 
-  // User State
-  const [userBalance, setUserBalance] = useState(24592.40);
+  const [userBalance, setUserBalance] = useState(DEFAULT_BALANCE);
   const [userPositions, setUserPositions] = useState<UserPositions>({
     long: null,
     short: null
   });
+  const isWalletConnected = walletAddress !== null;
+  const walletLabel = shortenAddress(walletAddress);
 
-  // Refs for simulation loop
-  const timeRef = useRef(0);
+  const formatCurrency = (val: number) => {
+    return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(val);
+  };
+
+  const connectWallet = async () => {
+    const provider = getEthereumProvider();
+    if (!provider) {
+      setWalletError('MetaMask not detected');
+      return;
+    }
+
+    try {
+      const accounts = await provider.request({ method: 'eth_requestAccounts' }) as string[];
+      if (!accounts?.length) {
+        setWalletError('No wallet account authorized');
+        return;
+      }
+
+      setWalletAddress(accounts[0]);
+      setWalletError(null);
+      setShowWalletMenu(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Wallet connection failed';
+      setWalletError(message);
+    }
+  };
 
   // Calculate unrealized PnL for a position
   const calculatePnL = (position: Position | null): number => {
@@ -64,101 +139,180 @@ export default function App() {
     return (userPositions.long?.amount || 0) + (userPositions.short?.amount || 0);
   }, [userPositions]);
 
-  // Simulation Loop
+  // Detect wallet session on load
   useEffect(() => {
-    const interval = setInterval(() => {
-      timeRef.current += 0.1;
-      const t = timeRef.current;
+    const provider = getEthereumProvider();
+    if (!provider) return;
 
-      const trendWave = Math.sin(t * 0.5) * 20;
-      const fastWave = Math.sin(t * 2.0) * 10;
-      const noise = (Math.random() - 0.5) * 5;
-      const delta = (trendWave + fastWave + noise) * 0.5;
-
-      setPrice(prevPrice => {
-        const newPrice = prevPrice + delta;
-        setPriceHistory(prev => {
-          const newHistory = [...prev, newPrice];
-          if (newHistory.length > 40) newHistory.shift();
-          return newHistory;
-        });
-        return newPrice;
+    provider.request({ method: 'eth_accounts' })
+      .then(result => {
+        const accounts = Array.isArray(result) ? result as string[] : [];
+        if (accounts.length > 0) {
+          setWalletAddress(accounts[0]);
+          setWalletError(null);
+        }
+      })
+      .catch(() => {
+        // Ignore passive session check errors.
       });
-
-      if (delta > 0) {
-        setTrend(prev => {
-          if (prev !== 'bull') {
-            setIsGlitching(true);
-            setTimeout(() => setIsGlitching(false), 300);
-            return 'bull';
-          }
-          return prev;
-        });
-      } else if (delta < 0) {
-        setTrend(prev => {
-          if (prev !== 'bear') {
-            setIsGlitching(true);
-            setTimeout(() => setIsGlitching(false), 300);
-            return 'bear';
-          }
-          return prev;
-        });
-      }
-
-      setDominance(prevDom => {
-        const shift = delta * 0.005;
-        let newDom = prevDom + shift;
-        if (newDom > 0.85) newDom = 0.85;
-        if (newDom < -0.85) newDom = -0.85;
-        return newDom;
-      });
-
-      setAllianceLiquidity(prev => prev + Math.floor(delta * 10 + (Math.random() - 0.5) * 500));
-      setSyndicateLiquidity(prev => prev - Math.floor(delta * 10 + (Math.random() - 0.5) * 500));
-
-      const isAllianceWin = delta > 0;
-      const amount = Math.abs(delta * 1000 + (Math.random() * 500));
-
-      const pnl = {
-        faction: isAllianceWin ? 'left' as const : 'right' as const,
-        amount: formatCurrency(amount),
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      };
-      setLatestPnL(pnl);
-      setBattleHistory(prev => [{ id: Date.now() + Math.random(), ...pnl }, ...prev].slice(0, 50));
-    }, 1000);
-
-    return () => clearInterval(interval);
   }, []);
 
-  const formatCurrency = (val: number) => {
-    return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(val);
-  };
+  // Track wallet account switching from provider events.
+  useEffect(() => {
+    const provider = getEthereumProvider();
+    if (!provider?.on) return;
+
+    const onAccountsChanged = (...args: unknown[]) => {
+      const accounts = Array.isArray(args[0]) ? args[0] as string[] : [];
+      if (accounts.length > 0) {
+        setWalletAddress(accounts[0]);
+        setWalletError(null);
+      } else {
+        setWalletAddress(null);
+        setShowWalletMenu(false);
+      }
+    };
+
+    provider.on('accountsChanged', onAccountsChanged);
+    return () => {
+      provider.removeListener?.('accountsChanged', onAccountsChanged);
+    };
+  }, []);
+
+  // Load/persist account-scoped demo portfolio.
+  useEffect(() => {
+    if (!walletAddress) {
+      setUserBalance(DEFAULT_BALANCE);
+      setUserPositions({ long: null, short: null });
+      return;
+    }
+
+    const storageKey = `perply-v1-wallet:${walletAddress.toLowerCase()}`;
+    const saved = localStorage.getItem(storageKey);
+    if (!saved) {
+      setUserBalance(DEFAULT_BALANCE);
+      setUserPositions({ long: null, short: null });
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(saved) as {
+        balance?: number;
+        positions?: UserPositions;
+      };
+      setUserBalance(typeof parsed.balance === 'number' ? parsed.balance : DEFAULT_BALANCE);
+      setUserPositions({
+        long: parsed.positions?.long ?? null,
+        short: parsed.positions?.short ?? null
+      });
+    } catch {
+      setUserBalance(DEFAULT_BALANCE);
+      setUserPositions({ long: null, short: null });
+    }
+  }, [walletAddress]);
+
+  useEffect(() => {
+    if (!walletAddress) return;
+    const storageKey = `perply-v1-wallet:${walletAddress.toLowerCase()}`;
+    localStorage.setItem(storageKey, JSON.stringify({
+      balance: userBalance,
+      positions: userPositions
+    }));
+  }, [walletAddress, userBalance, userPositions]);
+
+  // Live market data loop (primary: Binance, fallback: CoinGecko)
+  useEffect(() => {
+    let active = true;
+    const updateMarket = async () => {
+      const nextPrice = await fetchBtcPrice();
+      if (!active) return;
+      if (nextPrice === null) {
+        setPriceFeedStatus('degraded');
+        return;
+      }
+
+      setPriceFeedStatus('live');
+      setPrice(prevPrice => {
+        const delta = nextPrice - prevPrice;
+        setPriceHistory(prev => {
+          const newHistory = [...prev, nextPrice];
+          if (newHistory.length > PRICE_HISTORY_POINTS) newHistory.shift();
+          return newHistory;
+        });
+
+        if (delta !== 0) {
+          const nextTrend = delta > 0 ? 'bull' : 'bear';
+          setTrend(prev => {
+            if (prev !== nextTrend) {
+              setIsGlitching(true);
+              setTimeout(() => setIsGlitching(false), 300);
+            }
+            return nextTrend;
+          });
+
+          setDominance(prevDom => {
+            const shift = delta * 0.0005;
+            let newDom = prevDom + shift;
+            if (newDom > 0.85) newDom = 0.85;
+            if (newDom < -0.85) newDom = -0.85;
+            return newDom;
+          });
+
+          const liquidityDrift = Math.floor(delta * 6 + (Math.random() - 0.5) * 250);
+          setAllianceLiquidity(prev => Math.max(0, prev + liquidityDrift));
+          setSyndicateLiquidity(prev => Math.max(0, prev - liquidityDrift));
+
+          const isAllianceWin = delta > 0;
+          const amount = Math.abs(delta) * 40 + (Math.random() * 250);
+          const pnl = {
+            faction: isAllianceWin ? 'left' as const : 'right' as const,
+            amount: formatCurrency(amount),
+            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+          };
+          setLatestPnL(pnl);
+          setBattleHistory(prev => [{ id: Date.now() + Math.random(), ...pnl }, ...prev].slice(0, 50));
+        } else {
+          setTrend('neutral');
+        }
+
+        return nextPrice;
+      });
+    };
+
+    void updateMarket();
+    const interval = window.setInterval(() => {
+      void updateMarket();
+    }, MARKET_POLL_MS);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   const handleWalletClick = () => {
     if (!isWalletConnected) {
-      setIsWalletConnected(true);
-    } else {
-      setShowWalletMenu(!showWalletMenu);
+      void connectWallet();
+      return;
     }
+    setShowWalletMenu(prev => !prev);
   };
 
   const handleDisconnect = () => {
-    setIsWalletConnected(false);
+    setWalletAddress(null);
+    setWalletError(null);
     setShowWalletMenu(false);
-    setUserPositions({ long: null, short: null });
   };
 
   const handleBet = (side: 'long' | 'short') => {
     if (!isWalletConnected) {
-      setIsWalletConnected(true);
+      void connectWallet();
       return;
     }
 
     const existingPosition = side === 'long' ? userPositions.long : userPositions.short;
 
     if (existingPosition) {
-      // Close position
       const pnl = calculatePnL(existingPosition);
       setUserBalance(prev => prev + existingPosition.amount + pnl);
       setUserPositions(prev => ({
@@ -166,7 +320,6 @@ export default function App() {
         [side]: null
       }));
     } else {
-      // Open modal for new position
       setTradingSide(side);
       setIsTradingModalOpen(true);
     }
@@ -174,7 +327,11 @@ export default function App() {
 
   const confirmTrading = (margin: number, leverage: number) => {
     const positionSize = margin * leverage;
-    const fee = positionSize * 0.001;
+    const fee = positionSize * TRADING_FEE_RATE;
+
+    if (margin <= 0 || margin + fee > userBalance) {
+      return;
+    }
 
     setUserBalance(prev => prev - margin - fee);
     setUserPositions(prev => ({
@@ -248,28 +405,9 @@ export default function App() {
             {/* Left: Logo */}
             <div className="flex items-center space-x-4">
               <div className="flex items-center space-x-3 group cursor-pointer">
-                {/* Cyberpunk Lightning Logo */}
-                <div className="relative w-10 h-10 flex items-center justify-center">
-                  {/* Outer glow */}
-                  <div className="absolute inset-0 rounded-xl bg-neon-green/20 blur-md animate-pulse"></div>
-                  
-                  {/* Double rotating green rings */}
-                  <div className="absolute inset-0 rounded-xl border-2 border-neon-green/60 animate-spin-slow shadow-[0_0_10px_#39FF14]"></div>
-                  <div className="absolute inset-1 rounded-lg border border-dashed border-neon-green/40 animate-spin-slow" style={{ animationDirection: 'reverse', animationDuration: '12s' }}></div>
-                  
-                  {/* Black background */}
-                  <div className="absolute inset-2 rounded-md bg-black/80"></div>
-                  
-                  {/* Lightning bolt - Like reference image */}
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="relative z-10">
-                    {/* Red upper part - zigzag down-left */}
-                    <path d="M18 4L12 10L16 10L10 16" stroke="#FF003C" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" fill="none"/>
-                    {/* Green lower part - zigzag down-right */}
-                    <path d="M10 16L14 16L8 22" stroke="#39FF14" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" fill="none"/>
-                  </svg>
-                  
-                  {/* Center white glowing dot at the angle */}
-                  <div className="absolute w-1.5 h-1.5 bg-white rounded-full animate-pulse shadow-[0_0_6px_#ffffff,0_0_12px_#ffffff] z-20" style={{ top: '58%', left: '42%' }}></div>
+                <div className="relative w-8 h-8 flex items-center justify-center">
+                  <div className="absolute inset-0 border border-neon-green/30 rounded-full animate-spin-slow"></div>
+                  <Zap size={16} className="text-neon-green" />
                 </div>
                 
                 {/* Italic Styled Text */}
@@ -318,13 +456,16 @@ export default function App() {
                   }`}
                 >
                   <div className="absolute inset-0 bg-neon-blue/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>
-                  <span className="relative z-10">{isWalletConnected ? '0x71...F9e2' : 'Connect Wallet'}</span>
+                  <span className="relative z-10">{isWalletConnected ? walletLabel : 'Connect Wallet'}</span>
                   {isWalletConnected && (
                     <div className="relative z-10">
                       {showWalletMenu ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
                     </div>
                   )}
                 </button>
+                {walletError && (
+                  <div className="absolute right-0 mt-2 text-[8px] text-crimson-red font-mono whitespace-nowrap">{walletError}</div>
+                )}
 
                 {/* Wallet Dropdown */}
                 {isWalletConnected && showWalletMenu && (
@@ -335,7 +476,7 @@ export default function App() {
                           <Wallet size={14} className="text-neon-blue" />
                         </div>
                         <div>
-                          <div className="text-[10px] text-white font-bold tracking-wider">0x71...F9e2</div>
+                          <div className="text-[10px] text-white font-bold tracking-wider">{walletLabel}</div>
                           <div className="text-[8px] text-neon-green uppercase font-bold tracking-widest flex items-center">
                             <span className="w-1 h-1 bg-neon-green rounded-full mr-1 animate-pulse"></span>
                             Connected
@@ -449,6 +590,13 @@ export default function App() {
                   <span className="text-[8px] text-zinc-600">/</span>
                   <span className="text-[10px] md:text-xs font-bold text-zinc-500 uppercase tracking-widest">USD</span>
                   <span className="text-[7px] px-1.5 py-0.5 rounded bg-neon-blue/20 text-neon-blue border border-neon-blue/30 ml-2">PERP</span>
+                  <span className={`text-[7px] px-1.5 py-0.5 rounded border ml-1 ${
+                    priceFeedStatus === 'live'
+                      ? 'bg-neon-green/15 text-neon-green border-neon-green/40'
+                      : 'bg-neon-yellow/15 text-neon-yellow border-neon-yellow/40'
+                  }`}>
+                    {priceFeedStatus === 'live' ? 'LIVE' : 'DEGRADED'}
+                  </span>
                 </div>
                 <div className={`text-3xl md:text-5xl font-black font-mono tracking-tight transition-colors z-10 ${trend === 'bull' ? 'text-neon-green' : 'text-crimson-red'} ${isGlitching ? 'animate-glitch' : ''}`}>
                   {price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
