@@ -10,7 +10,9 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "contract:build": "forge build",
-    "contract:deploy:monad": "bash scripts/deploy-monad.sh"
+    "contract:deploy:monad": "bash scripts/deploy-monad.sh",
+    "contract:set-risk:monad": "bash scripts/set-risk-params-monad.sh",
+    "contract:smoke-fees:monad": "bash scripts/smoke-check-fees-monad.sh"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

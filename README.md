@@ -47,6 +47,23 @@ export INITIAL_BTC_PRICE_E8=9000000000000
 npm run contract:deploy:monad
 ```
 
+Apply live risk params (including fees) on an existing deployment:
+
+```bash
+export DEPLOYER_PRIVATE_KEY=0xyour_private_key
+export PERPLY_ARENA_ADDRESS=0xYourDeployedContractAddress
+export MONAD_RPC_URL=https://testnet-rpc.monad.xyz
+npm run contract:set-risk:monad
+```
+
+Smoke check live fee params:
+
+```bash
+export PERPLY_ARENA_ADDRESS=0xYourDeployedContractAddress
+export MONAD_RPC_URL=https://testnet-rpc.monad.xyz
+npm run contract:smoke-fees:monad
+```
+
 ## Frontend Env
 
 Create `.env.local`:
