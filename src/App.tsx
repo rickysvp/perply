@@ -202,6 +202,37 @@ export default function App() {
     return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(val);
   };
 
+  const parseAmountInput = (raw: string | null): number | null => {
+    if (raw === null) return null;
+    const normalized = raw.trim().replace(',', '.');
+    if (!normalized) return null;
+    const amount = Number(normalized);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setWalletError('Invalid amount. Example: 0.1');
+      return null;
+    }
+    return amount;
+  };
+
+  const toReadableError = (error: unknown, fallback: string): string => {
+    const code = (error as { code?: number })?.code;
+    const message = (error as { shortMessage?: string; message?: string })?.shortMessage
+      ?? (error as { message?: string })?.message
+      ?? fallback;
+    const lower = message.toLowerCase();
+
+    if (code === 4001 || lower.includes('user rejected')) {
+      return 'Transaction rejected in wallet';
+    }
+    if (lower.includes('insufficient funds')) {
+      return 'Wallet MON balance is insufficient (amount + gas)';
+    }
+    if (lower.includes('missing v')) {
+      return 'Invalid wallet signature payload';
+    }
+    return message;
+  };
+
   const formatTimestamp = (timestampSec: number): string => {
     return new Date(timestampSec * 1000).toLocaleTimeString([], {
       hour: '2-digit',
@@ -458,33 +489,51 @@ export default function App() {
   };
 
   const handleDeposit = async () => {
-    if (!isWalletConnected) return;
+    if (!isWalletConnected) {
+      setWalletError('Connect wallet first');
+      return;
+    }
     const input = window.prompt('Deposit MON amount', '1');
-    if (!input) return;
-    const amount = Number(input);
-    if (!Number.isFinite(amount) || amount <= 0) return;
+    const amount = parseAmountInput(input);
+    if (!amount) return;
 
     try {
       setIsTxPending(true);
+      const provider = getEthereumProvider();
+      if (!provider) throw new Error('Wallet provider not found');
+      const browserProvider = new ethers.BrowserProvider(provider);
+      const signer = await browserProvider.getSigner();
+      const walletNativeBalance = await browserProvider.getBalance(await signer.getAddress());
+      const value = ethers.parseEther(amount.toString());
+      if (walletNativeBalance < value) {
+        setWalletError('Wallet MON balance is lower than deposit amount');
+        return;
+      }
       const contract = await getWriteContract();
-      const tx = await contract.deposit({ value: ethers.parseEther(amount.toString()) });
+      const tx = await contract.deposit({ value });
       await tx.wait();
       await refreshOnchainState();
       setShowWalletMenu(false);
+      setWalletError(null);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Deposit failed';
-      setWalletError(message);
+      setWalletError(toReadableError(error, 'Deposit failed'));
     } finally {
       setIsTxPending(false);
     }
   };
 
   const handleWithdraw = async () => {
-    if (!isWalletConnected) return;
+    if (!isWalletConnected) {
+      setWalletError('Connect wallet first');
+      return;
+    }
     const input = window.prompt('Withdraw MON amount', '1');
-    if (!input) return;
-    const amount = Number(input);
-    if (!Number.isFinite(amount) || amount <= 0) return;
+    const amount = parseAmountInput(input);
+    if (!amount) return;
+    if (amount > userBalance) {
+      setWalletError(`Insufficient contract available balance: ${formatCurrency(userBalance)} MON`);
+      return;
+    }
 
     try {
       setIsTxPending(true);
@@ -493,9 +542,9 @@ export default function App() {
       await tx.wait();
       await refreshOnchainState();
       setShowWalletMenu(false);
+      setWalletError(null);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Withdraw failed';
-      setWalletError(message);
+      setWalletError(toReadableError(error, 'Withdraw failed'));
     } finally {
       setIsTxPending(false);
     }
