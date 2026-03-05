@@ -397,7 +397,6 @@ export default function App() {
         available,
         longPos,
         shortPos,
-        markPrice,
         congestionRates,
         longRewards,
         shortRewards,
@@ -425,7 +424,6 @@ export default function App() {
           equity: bigint;
           maintenanceMargin: bigint;
         }>,
-        readContract.markPriceE8() as Promise<bigint>,
         readContract.getCongestionRatesBps() as Promise<[bigint, bigint]>,
         readContract.cumulativeCongestionRewards(0) as Promise<bigint>,
         readContract.cumulativeCongestionRewards(1) as Promise<bigint>,
@@ -438,13 +436,15 @@ export default function App() {
         keeperResult,
         lastSettleResult,
         minIntervalResult,
-        volTriggerBpsResult
+        volTriggerBpsResult,
+        markPriceResult
       ] = await Promise.allSettled([
         readContract.owner() as Promise<string>,
         readContract.keeper() as Promise<string>,
         readContract.lastSettlementAt() as Promise<bigint>,
         readContract.minSettlementInterval() as Promise<bigint>,
-        readContract.volatilityTriggerBps() as Promise<bigint>
+        readContract.volatilityTriggerBps() as Promise<bigint>,
+        readContract.markPriceE8() as Promise<bigint>
       ]);
 
       setUserBalance(Number(ethers.formatEther(available)));
@@ -457,7 +457,9 @@ export default function App() {
       setLastSettlementAt(lastSettleResult.status === 'fulfilled' ? Number(lastSettleResult.value) : null);
       setMinSettlementIntervalSec(minIntervalResult.status === 'fulfilled' ? Number(minIntervalResult.value) : 10);
       setVolatilityTriggerPct(volTriggerBpsResult.status === 'fulfilled' ? Number(volTriggerBpsResult.value) / 100 : 0.15);
-      setOnchainMarkPrice(fromPriceE8(markPrice));
+      if (markPriceResult.status === 'fulfilled') {
+        setOnchainMarkPrice(fromPriceE8(markPriceResult.value));
+      }
       setLongCongestionRateBps(Number(congestionRates[0]));
       setShortCongestionRateBps(Number(congestionRates[1]));
       setLongCongestionRewards(Number(ethers.formatEther(longRewards)));
@@ -468,6 +470,10 @@ export default function App() {
       setWalletError(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to load on-chain state';
+      if (message.includes('CALL_EXCEPTION') || message.includes('missing revert data')) {
+        setWalletError('Some on-chain stats are temporarily unavailable. Please retry.');
+        return;
+      }
       setWalletError(message);
     }
   };
