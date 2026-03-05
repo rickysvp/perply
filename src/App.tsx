@@ -246,15 +246,41 @@ export default function App() {
             <div className="absolute inset-0 data-stream-bg opacity-10"></div>
 
             {/* Left: Logo */}
-            <div className="flex items-center space-x-8">
+            <div className="flex items-center space-x-4">
               <div className="flex items-center space-x-3 group cursor-pointer">
-                <div className="relative w-8 h-8 flex items-center justify-center">
-                  <div className="absolute inset-0 border border-neon-green/30 rounded-full animate-spin-slow"></div>
-                  <Zap size={16} className="text-neon-green" />
+                {/* Cyberpunk Lightning Logo */}
+                <div className="relative w-10 h-10 flex items-center justify-center">
+                  {/* Outer glow */}
+                  <div className="absolute inset-0 rounded-xl bg-neon-green/20 blur-md animate-pulse"></div>
+                  
+                  {/* Double rotating green rings */}
+                  <div className="absolute inset-0 rounded-xl border-2 border-neon-green/60 animate-spin-slow shadow-[0_0_10px_#39FF14]"></div>
+                  <div className="absolute inset-1 rounded-lg border border-dashed border-neon-green/40 animate-spin-slow" style={{ animationDirection: 'reverse', animationDuration: '12s' }}></div>
+                  
+                  {/* Black background */}
+                  <div className="absolute inset-2 rounded-md bg-black/80"></div>
+                  
+                  {/* Lightning bolt - Two lines forming lightning */}
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="relative z-10">
+                    {/* Red line - upper left to center */}
+                    <path d="M4 6L12 12" stroke="#FF003C" strokeWidth="2.5" strokeLinecap="round"/>
+                    {/* Green line - center to lower right */}
+                    <path d="M12 12L20 18" stroke="#39FF14" strokeWidth="2.5" strokeLinecap="round"/>
+                    {/* Red line - upper right to center */}
+                    <path d="M20 6L12 12" stroke="#FF003C" strokeWidth="2.5" strokeLinecap="round"/>
+                    {/* Green line - center to lower left */}
+                    <path d="M12 12L4 18" stroke="#39FF14" strokeWidth="2.5" strokeLinecap="round"/>
+                  </svg>
+                  
+                  {/* Center white glowing dot */}
+                  <div className="absolute w-2 h-2 bg-white rounded-full animate-pulse shadow-[0_0_8px_#ffffff,0_0_16px_#ffffff] z-20"></div>
                 </div>
-                <h1 className="text-xl font-black tracking-tighter" style={{ fontFamily: "'Orbitron', sans-serif" }}>
-                  <span className="text-neon-green">PERPLY</span>
-                  <span className="text-white">.FUN</span>
+                
+                {/* Italic Styled Text */}
+                <h1 className="text-xl font-black italic tracking-normal" style={{ fontFamily: "'Orbitron', sans-serif", fontStyle: 'italic' }}>
+                  <span className="text-white">perply</span>
+                  <span className="text-crimson-red">.</span>
+                  <span className="text-neon-green">fun</span>
                 </h1>
               </div>
             </div>
@@ -265,22 +291,22 @@ export default function App() {
               {isWalletConnected && (
                 <div className="hidden lg:flex items-center space-x-6 border-r border-white/10 pr-6 bg-black/50 px-4 py-2 rounded backdrop-blur-sm">
                   <div className="flex flex-col items-end">
-                    <span className="text-[8px] font-mono text-zinc-500 uppercase tracking-widest font-mono">Balance</span>
-                    <span className="text-[11px] font-bold text-white font-mono">{formatCurrency(userBalance)} <span className="font-mono text-[9px]">$MON</span></span>
+                    <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest font-mono">Balance</span>
+                    <span className="text-[14px] font-bold text-white font-mono">{formatCurrency(userBalance)} <span className="font-mono text-[11px]">$MON</span></span>
                   </div>
                   <div className="flex flex-col items-end">
-                    <span className="text-[8px] font-mono text-zinc-500 uppercase tracking-widest font-mono">Margin</span>
-                    <span className="text-[11px] font-bold text-neon-blue font-mono">{formatCurrency(totalMargin)} <span className="font-mono text-[9px]">$MON</span></span>
+                    <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest font-mono">Margin</span>
+                    <span className="text-[14px] font-bold text-neon-blue font-mono">{formatCurrency(totalMargin)} <span className="font-mono text-[11px]">$MON</span></span>
                   </div>
                   <div className="flex flex-col items-end">
-                    <span className="text-[8px] font-mono text-zinc-500 uppercase tracking-widest font-mono">PnL</span>
-                    <span className={`text-[11px] font-bold font-mono ${totalUnrealizedPnL >= 0 ? 'text-neon-green' : 'text-crimson-red'}`}>
+                    <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest font-mono">PnL</span>
+                    <span className={`text-[14px] font-bold font-mono ${totalUnrealizedPnL >= 0 ? 'text-neon-green' : 'text-crimson-red'}`}>
                       {totalUnrealizedPnL >= 0 ? '+' : ''}{formatCurrency(totalUnrealizedPnL)}
                     </span>
                   </div>
                   <div className="flex flex-col items-end">
-                    <span className="text-[8px] font-mono text-zinc-500 uppercase tracking-widest font-mono">ROE</span>
-                    <span className={`text-[11px] font-bold font-mono ${totalUnrealizedPnL >= 0 ? 'text-neon-green' : 'text-crimson-red'}`}>
+                    <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest font-mono">ROE</span>
+                    <span className={`text-[14px] font-bold font-mono ${totalUnrealizedPnL >= 0 ? 'text-neon-green' : 'text-crimson-red'}`}>
                       {totalMargin > 0 ? ((totalUnrealizedPnL / totalMargin) * 100).toFixed(2) : '0.00'}%
                     </span>
                   </div>
