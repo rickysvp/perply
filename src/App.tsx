@@ -26,32 +26,109 @@ const DEFAULT_PRICE = 64289.40;
 const DEFAULT_BALANCE = 0;
 const PRICE_HISTORY_POINTS = 40;
 const MARKET_POLL_MS = 3000;
-const TRADING_FEE_RATE = 0.001;
+const DEFAULT_PYTH_BTC_PRICE_ID = '0xe62df6c8b4a85fe1fef3f1a6d5af3f4820553a4f8f8036f2fa14de3cd59adf04';
 
-async function fetchBtcPrice(): Promise<number | null> {
+interface PriceAggregate {
+  price: number;
+  sourceCount: number;
+}
+
+interface OpenPreview {
+  openFee: number;
+  congestionRateBps: number;
+  congestionFee: number;
+  congestionToOpposite: number;
+  congestionToTreasury: number;
+  totalRequired: number;
+}
+
+async function fetchBinancePrice(): Promise<number | null> {
   try {
     const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
-    if (res.ok) {
-      const data = await res.json() as { price?: string };
-      const price = Number(data.price);
-      if (Number.isFinite(price) && price > 0) return price;
-    }
+    if (!res.ok) return null;
+    const data = await res.json() as { price?: string };
+    const price = Number(data.price);
+    return Number.isFinite(price) && price > 0 ? price : null;
   } catch {
-    // Try fallback provider below.
+    return null;
   }
+}
 
+async function fetchCoingeckoPrice(): Promise<number | null> {
   try {
     const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
-    if (res.ok) {
-      const data = await res.json() as { bitcoin?: { usd?: number } };
-      const price = Number(data.bitcoin?.usd);
-      if (Number.isFinite(price) && price > 0) return price;
-    }
+    if (!res.ok) return null;
+    const data = await res.json() as { bitcoin?: { usd?: number } };
+    const price = Number(data.bitcoin?.usd);
+    return Number.isFinite(price) && price > 0 ? price : null;
   } catch {
-    // Return null to keep previous price when both providers fail.
+    return null;
+  }
+}
+
+async function fetchPythPrice(): Promise<number | null> {
+  try {
+    const pythPriceId = import.meta.env.VITE_PYTH_BTC_PRICE_ID || DEFAULT_PYTH_BTC_PRICE_ID;
+    const url = `https://hermes.pyth.network/v2/updates/price/latest?ids[]=${pythPriceId}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json() as {
+      parsed?: Array<{ price?: { price?: string; expo?: number } }>;
+    };
+    const entry = data.parsed?.[0]?.price;
+    if (!entry?.price || entry.expo === undefined) return null;
+    const value = Number(entry.price) * Math.pow(10, entry.expo);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchChainlinkPrice(): Promise<number | null> {
+  try {
+    const feedAddress = import.meta.env.VITE_CHAINLINK_BTC_USD_FEED;
+    if (!feedAddress) return null;
+    const provider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
+    const feed = new ethers.Contract(
+      feedAddress,
+      ['function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)'],
+      provider
+    );
+    const round = await feed.latestRoundData() as [bigint, bigint, bigint, bigint, bigint];
+    const answer = Number(round[1]);
+    if (!Number.isFinite(answer) || answer <= 0) return null;
+    return answer / 1e8;
+  } catch {
+    return null;
+  }
+}
+
+function aggregatePrices(prices: number[]): number | null {
+  if (prices.length === 0) return null;
+  if (prices.length === 1) return prices[0];
+
+  const sorted = [...prices].sort((a, b) => a - b);
+  if (sorted.length >= 3) {
+    const trimmed = sorted.slice(1, sorted.length - 1);
+    const sum = trimmed.reduce((acc, val) => acc + val, 0);
+    return sum / trimmed.length;
   }
 
-  return null;
+  const sum = sorted.reduce((acc, val) => acc + val, 0);
+  return sum / sorted.length;
+}
+
+async function fetchBtcPrice(): Promise<PriceAggregate | null> {
+  const results = await Promise.all([
+    fetchBinancePrice(),
+    fetchPythPrice(),
+    fetchChainlinkPrice(),
+    fetchCoingeckoPrice()
+  ]);
+  const prices = results.filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0);
+  const aggregated = aggregatePrices(prices);
+  if (!aggregated) return null;
+  return { price: aggregated, sourceCount: prices.length };
 }
 
 export default function App() {
@@ -69,6 +146,10 @@ export default function App() {
   const [priceFeedStatus, setPriceFeedStatus] = useState<'live' | 'degraded'>('live');
   const [isTxPending, setIsTxPending] = useState(false);
   const [onchainMarkPrice, setOnchainMarkPrice] = useState<number | null>(null);
+  const [longCongestionRateBps, setLongCongestionRateBps] = useState(0);
+  const [shortCongestionRateBps, setShortCongestionRateBps] = useState(0);
+  const [longCongestionRewards, setLongCongestionRewards] = useState(0);
+  const [shortCongestionRewards, setShortCongestionRewards] = useState(0);
   const [showWalletMenu, setShowWalletMenu] = useState(false);
   const [isTradingModalOpen, setIsTradingModalOpen] = useState(false);
   const [tradingSide, setTradingSide] = useState<'long' | 'short'>('long');
@@ -90,6 +171,7 @@ export default function App() {
   // Calculate unrealized PnL for a position
   const calculatePnL = (position: Position | null): number => {
     if (!position) return 0;
+    if (typeof position.onchainPnl === 'number') return position.onchainPnl;
     if (position.side === 'long') {
       return (price - position.entryPrice) * ((position.amount * position.leverage) / position.entryPrice);
     } else {
@@ -100,6 +182,10 @@ export default function App() {
   // Calculate ROE for a position
   const calculateROE = (position: Position | null): number => {
     if (!position || position.amount === 0) return 0;
+    if (typeof position.onchainEquity === 'number') {
+      const pnl = (position.onchainEquity ?? position.amount) - position.amount;
+      return (pnl / position.amount) * 100;
+    }
     const pnl = calculatePnL(position);
     return (pnl / position.amount) * 100;
   };
@@ -115,7 +201,15 @@ export default function App() {
   }, [userPositions]);
 
   const mapOnchainPosition = (
-    raw: { margin: bigint; leverage: bigint; entryPriceE8: bigint; isOpen: boolean },
+    raw: {
+      margin: bigint;
+      leverage: bigint;
+      entryPriceE8: bigint;
+      isOpen: boolean;
+      pnl: bigint;
+      equity: bigint;
+      maintenanceMargin: bigint;
+    },
     side: 'long' | 'short'
   ): Position | null => {
     if (!raw.isOpen) return null;
@@ -123,7 +217,10 @@ export default function App() {
       side,
       amount: Number(ethers.formatEther(raw.margin)),
       entryPrice: fromPriceE8(raw.entryPriceE8),
-      leverage: Number(raw.leverage)
+      leverage: Number(raw.leverage),
+      onchainPnl: Number(ethers.formatEther(raw.pnl)),
+      onchainEquity: Number(ethers.formatEther(raw.equity)),
+      maintenanceMargin: Number(ethers.formatEther(raw.maintenanceMargin))
     };
   };
 
@@ -138,21 +235,58 @@ export default function App() {
   };
 
   const refreshOnchainState = async (addressOverride?: string) => {
-    const trader = addressOverride ?? walletAddress;
-    if (!trader || !arenaAddress) {
+    if (!arenaAddress) {
       setUserBalance(DEFAULT_BALANCE);
       setUserPositions({ long: null, short: null });
+      setLongCongestionRateBps(0);
+      setShortCongestionRateBps(0);
+      setLongCongestionRewards(0);
+      setShortCongestionRewards(0);
       return;
     }
+    const trader = addressOverride ?? walletAddress ?? ethers.ZeroAddress;
 
     try {
       const readProvider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
       const readContract = new ethers.Contract(arenaAddress, PERPLY_ARENA_ABI, readProvider);
-      const [available, longPos, shortPos, markPrice] = await Promise.all([
+      const [
+        available,
+        longPos,
+        shortPos,
+        markPrice,
+        congestionRates,
+        longRewards,
+        shortRewards,
+        longWeight,
+        shortWeight
+      ] = await Promise.all([
         readContract.availableBalance(trader) as Promise<bigint>,
-        readContract.getPosition(trader, 0) as Promise<{ margin: bigint; leverage: bigint; entryPriceE8: bigint; isOpen: boolean }>,
-        readContract.getPosition(trader, 1) as Promise<{ margin: bigint; leverage: bigint; entryPriceE8: bigint; isOpen: boolean }>,
-        readContract.markPriceE8() as Promise<bigint>
+        readContract.getPosition(trader, 0) as Promise<{
+          margin: bigint;
+          weight: bigint;
+          leverage: bigint;
+          entryPriceE8: bigint;
+          isOpen: boolean;
+          pnl: bigint;
+          equity: bigint;
+          maintenanceMargin: bigint;
+        }>,
+        readContract.getPosition(trader, 1) as Promise<{
+          margin: bigint;
+          weight: bigint;
+          leverage: bigint;
+          entryPriceE8: bigint;
+          isOpen: boolean;
+          pnl: bigint;
+          equity: bigint;
+          maintenanceMargin: bigint;
+        }>,
+        readContract.markPriceE8() as Promise<bigint>,
+        readContract.getCongestionRatesBps() as Promise<[bigint, bigint]>,
+        readContract.cumulativeCongestionRewards(0) as Promise<bigint>,
+        readContract.cumulativeCongestionRewards(1) as Promise<bigint>,
+        readContract.sideWeight(0) as Promise<bigint>,
+        readContract.sideWeight(1) as Promise<bigint>
       ]);
 
       setUserBalance(Number(ethers.formatEther(available)));
@@ -161,6 +295,12 @@ export default function App() {
         short: mapOnchainPosition(shortPos, 'short')
       });
       setOnchainMarkPrice(fromPriceE8(markPrice));
+      setLongCongestionRateBps(Number(congestionRates[0]));
+      setShortCongestionRateBps(Number(congestionRates[1]));
+      setLongCongestionRewards(Number(ethers.formatEther(longRewards)));
+      setShortCongestionRewards(Number(ethers.formatEther(shortRewards)));
+      setAllianceLiquidity(Number(ethers.formatEther(longWeight)));
+      setSyndicateLiquidity(Number(ethers.formatEther(shortWeight)));
       setWalletError(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to load on-chain state';
@@ -246,11 +386,11 @@ export default function App() {
     try {
       setIsTxPending(true);
       const contract = await getWriteContract();
-      const tx = await contract.setMarkPrice(toPriceE8(price));
+      const tx = await contract.settleWithPrice(toPriceE8(price));
       await tx.wait();
       await refreshOnchainState();
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Mark price update failed';
+      const message = error instanceof Error ? error.message : 'Settlement tick failed';
       setWalletError(message);
     } finally {
       setIsTxPending(false);
@@ -307,19 +447,20 @@ export default function App() {
     };
   }, [walletAddress]);
 
-  // Live market data loop (primary: Binance, fallback: CoinGecko)
+  // Live market data loop (Binance / Pyth / Chainlink / CoinGecko aggregate)
   useEffect(() => {
     let active = true;
     const updateMarket = async () => {
-      const nextPrice = await fetchBtcPrice();
+      const aggregate = await fetchBtcPrice();
       if (!active) return;
-      if (nextPrice === null) {
+      if (!aggregate) {
         setPriceFeedStatus('degraded');
         return;
       }
 
-      setPriceFeedStatus('live');
+      setPriceFeedStatus(aggregate.sourceCount >= 2 ? 'live' : 'degraded');
       setPrice(prevPrice => {
+        const nextPrice = aggregate.price;
         const delta = nextPrice - prevPrice;
         setPriceHistory(prev => {
           const newHistory = [...prev, nextPrice];
@@ -344,10 +485,6 @@ export default function App() {
             if (newDom < -0.85) newDom = -0.85;
             return newDom;
           });
-
-          const liquidityDrift = Math.floor(delta * 6 + (Math.random() - 0.5) * 250);
-          setAllianceLiquidity(prev => Math.max(0, prev + liquidityDrift));
-          setSyndicateLiquidity(prev => Math.max(0, prev - liquidityDrift));
 
           const isAllianceWin = delta > 0;
           const amount = Math.abs(delta) * 40 + (Math.random() * 250);
@@ -376,6 +513,50 @@ export default function App() {
       window.clearInterval(interval);
     };
   }, []);
+
+  useEffect(() => {
+    if (!arenaAddress) return;
+    void refreshOnchainState(walletAddress ?? undefined);
+    const interval = window.setInterval(() => {
+      void refreshOnchainState(walletAddress ?? undefined);
+    }, 8000);
+    return () => window.clearInterval(interval);
+  }, [walletAddress, arenaAddress]);
+
+  const getOpenPreview = async (side: 'long' | 'short', margin: number, leverage: number): Promise<OpenPreview | null> => {
+    if (!arenaAddress || margin <= 0 || leverage <= 0) return null;
+    try {
+      const provider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
+      const contract = new ethers.Contract(arenaAddress, PERPLY_ARENA_ABI, provider);
+      const sideId = side === 'long' ? 0 : 1;
+      const result = await contract.previewOpen(sideId, ethers.parseEther(margin.toString()), leverage) as [
+        bigint,
+        bigint,
+        bigint,
+        bigint,
+        bigint,
+        bigint
+      ];
+      return {
+        openFee: Number(ethers.formatEther(result[0])),
+        congestionRateBps: Number(result[1]),
+        congestionFee: Number(ethers.formatEther(result[2])),
+        congestionToOpposite: Number(ethers.formatEther(result[3])),
+        congestionToTreasury: Number(ethers.formatEther(result[4])),
+        totalRequired: Number(ethers.formatEther(result[5]))
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const handlePreviewRequest = async (margin: number, leverage: number): Promise<OpenPreview | null> => {
+    if (!isContractConfigured) {
+      return null;
+    }
+    const preview = await getOpenPreview(tradingSide, margin, leverage);
+    return preview;
+  };
 
   const handleWalletClick = () => {
     if (!isWalletConnected) {
@@ -429,9 +610,8 @@ export default function App() {
   const confirmTrading = async (margin: number, leverage: number) => {
     if (!isWalletConnected || !isContractConfigured) return;
 
-    const positionSize = margin * leverage;
-    const fee = positionSize * TRADING_FEE_RATE;
-    if (margin <= 0 || margin + fee > userBalance) {
+    const preview = await getOpenPreview(tradingSide, margin, leverage);
+    if (!preview || margin <= 0 || preview.totalRequired > userBalance) {
       return;
     }
 
@@ -458,6 +638,7 @@ export default function App() {
 
     const pnl = calculatePnL(position);
     const roe = calculateROE(position);
+    const equity = typeof position.onchainEquity === 'number' ? position.onchainEquity : position.amount + pnl;
     const isLong = side === 'long';
 
     return (
@@ -489,6 +670,18 @@ export default function App() {
               {roe >= 0 ? '+' : ''}{roe.toFixed(2)}%
             </div>
           </div>
+          <div>
+            <div className="text-[7px] text-zinc-500 uppercase font-bold">Equity</div>
+            <div className="text-xs font-mono font-black text-white">
+              {formatCurrency(equity)} <span className="text-[8px] opacity-50">$MON</span>
+            </div>
+          </div>
+          <div>
+            <div className="text-[7px] text-zinc-500 uppercase font-bold">MMR</div>
+            <div className="text-xs font-mono font-black text-neon-yellow">
+              {formatCurrency(position.maintenanceMargin ?? 0)} <span className="text-[8px] opacity-50">$MON</span>
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -512,8 +705,12 @@ export default function App() {
             <div className="flex items-center space-x-4">
               <div className="flex items-center space-x-3 group cursor-pointer">
                 <div className="relative w-8 h-8 flex items-center justify-center">
-                  <div className="absolute inset-0 border border-neon-green/30 rounded-full animate-spin-slow"></div>
-                  <Zap size={16} className="text-neon-green" />
+                  {/* Dashed rotating ring */}
+                  <div className="absolute inset-0 border-2 border-dashed border-neon-green/50 rounded-full animate-spin-slow"></div>
+                  {/* Inner solid ring rotating reverse */}
+                  <div className="absolute inset-1 border border-neon-green/30 rounded-full animate-spin-slow" style={{ animationDirection: 'reverse', animationDuration: '15s' }}></div>
+                  {/* Pulsing lightning bolt */}
+                  <Zap size={16} className="text-neon-green animate-pulse relative z-10" style={{ filter: 'drop-shadow(0 0 4px #39FF14)' }} />
                 </div>
                 
                 {/* Italic Styled Text */}
@@ -647,7 +844,7 @@ export default function App() {
                         disabled={isTxPending}
                         className="w-full py-2 bg-neon-green/10 hover:bg-neon-green/20 border border-neon-green/30 rounded-sm text-[9px] text-neon-green font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                       >
-                        Sync Price On-Chain
+                        Run Settlement Tick
                       </button>
                       <button
                         onClick={handleDisconnect}
@@ -683,6 +880,12 @@ export default function App() {
                       {formatCurrency(allianceLiquidity)}
                       <span className="text-[10px] md:text-xs ml-2 opacity-50" style={{ fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.05em' }}>$MON</span>
                     </span>
+                    <span className="text-[8px] mt-1 text-neon-green/80 font-mono">
+                      Congestion Bonus Earned: +{formatCurrency(longCongestionRewards)} MON
+                    </span>
+                    <span className="text-[8px] text-zinc-500 font-mono">
+                      Long-side surcharge now: {(longCongestionRateBps / 100).toFixed(2)}%
+                    </span>
                   </div>
                 </div>
 
@@ -703,6 +906,12 @@ export default function App() {
                     <span className="text-2xl md:text-4xl font-black text-crimson-red" style={{ fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.02em' }}>
                       {formatCurrency(syndicateLiquidity)}
                       <span className="text-[10px] md:text-xs ml-2 opacity-50" style={{ fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.05em' }}>$MON</span>
+                    </span>
+                    <span className="text-[8px] mt-1 text-crimson-red/80 font-mono">
+                      Congestion Bonus Earned: +{formatCurrency(shortCongestionRewards)} MON
+                    </span>
+                    <span className="text-[8px] text-zinc-500 font-mono">
+                      Short-side surcharge now: {(shortCongestionRateBps / 100).toFixed(2)}%
                     </span>
                   </div>
                 </div>
@@ -831,7 +1040,9 @@ export default function App() {
         side={tradingSide}
         currentPrice={price}
         userBalance={userBalance}
+        isTxPending={isTxPending}
         onConfirm={confirmTrading}
+        onPreview={handlePreviewRequest}
       />
     </>
   );

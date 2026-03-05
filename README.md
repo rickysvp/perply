@@ -1,6 +1,11 @@
-# Perply.fun V1 (Frontend + Smart Contract)
+# Perply.fun Arena V1.1 (Frontend + Smart Contract)
 
-Web3 perpetual battle arena MVP on Monad testnet.
+Web3 long/short arena on Monad testnet.
+
+- Not a classic perp exchange
+- Camp-vs-camp settlement engine
+- Winner side gets value from loser side
+- No backend required for core gameplay
 
 - Frontend: React + Vite
 - Smart contract: Solidity + Foundry
@@ -48,6 +53,8 @@ Create `.env.local`:
 
 ```bash
 VITE_PERPLY_ARENA_ADDRESS=0xYourDeployedContractAddress
+VITE_PYTH_BTC_PRICE_ID=0xe62df6c8b4a85fe1fef3f1a6d5af3f4820553a4f8f8036f2fa14de3cd59adf04
+VITE_CHAINLINK_BTC_USD_FEED=0x... # optional
 ```
 
 ## Run Frontend
@@ -56,10 +63,22 @@ VITE_PERPLY_ARENA_ADDRESS=0xYourDeployedContractAddress
 npm run dev
 ```
 
-## V1 Features Implemented
+## V1.1 Rules Implemented
 
-1. MetaMask wallet connect and network switch to Monad testnet
-2. On-chain `deposit` / `withdraw`
-3. On-chain `openPosition` / `closePosition` (long/short)
-4. On-chain position and balance sync in UI
-5. Manual on-chain mark price sync from frontend (owner-only tx)
+1. Open fee `1.0%`
+2. Close fee `1.0%`
+3. Settlement fee `0.01%` per tick
+4. Dynamic congestion surcharge on crowded side
+5. Congestion surcharge split: `80%` to opposite camp, `20%` to treasury
+6. Tick settlement: `10s` interval + early trigger when volatility threshold reached
+7. Liquidation mechanism with maintenance margin and liquidation penalty
+8. Frontend fee preview before placing bet (includes congestion surcharge and opponent reward)
+
+## V1.1 Source Aggregation
+
+Frontend uses aggregated BTC mark proxy from:
+
+1. Binance
+2. Pyth
+3. Chainlink (if feed address configured)
+4. CoinGecko

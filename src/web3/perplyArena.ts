@@ -16,15 +16,18 @@ export const MONAD_TESTNET = {
 export const PERPLY_ARENA_ABI = [
   'function markPriceE8() view returns (uint256)',
   'function availableBalance(address) view returns (uint256)',
-  'function lockedMargin(address) view returns (uint256)',
-  'function getPosition(address trader, uint8 side) view returns (tuple(uint256 margin, uint32 leverage, uint64 entryPriceE8, bool isOpen))',
+  'function getPosition(address trader, uint8 side) view returns (tuple(uint256 margin, uint256 weight, uint32 leverage, uint64 entryPriceE8, bool isOpen, int256 pnl, int256 equity, uint256 maintenanceMargin))',
+  'function getCongestionRatesBps() view returns (uint16 longRate, uint16 shortRate)',
+  'function cumulativeCongestionRewards(uint8 side) view returns (uint256)',
+  'function sideWeight(uint8 side) view returns (uint256)',
+  'function previewOpen(uint8 side, uint256 margin, uint32 leverage) view returns (uint256 openFee, uint16 congestionRateBps, uint256 congestionFee, uint256 congestionToOpposite, uint256 congestionToTreasury, uint256 totalRequired)',
   'function deposit() payable',
   'function withdraw(uint256 amount)',
   'function openPosition(uint8 side, uint256 margin, uint32 leverage)',
   'function closePosition(uint8 side)',
-  'function setMarkPrice(uint256 newPriceE8)',
-  'event PositionOpened(address indexed trader, uint8 indexed side, uint256 margin, uint32 leverage, uint64 entryPriceE8, uint256 feePaid)',
-  'event PositionClosed(address indexed trader, uint8 indexed side, uint256 margin, uint32 leverage, uint64 entryPriceE8, uint64 exitPriceE8, int256 pnl, uint256 settlement)'
+  'function settleWithPrice(uint256 newPriceE8)',
+  'event PositionOpened(address indexed trader, uint8 indexed side, uint256 margin, uint32 leverage, uint256 weight, uint256 openFee, uint16 congestionRateBps, uint256 congestionFee, uint256 congestionToOpposite, uint256 congestionToTreasury)',
+  'event PositionClosed(address indexed trader, uint8 indexed side, uint256 margin, uint256 weight, uint32 leverage, int256 pnl, int256 equityBeforeFees, uint256 closeFee, uint256 payout)'
 ] as const;
 
 export interface WalletProvider {
@@ -35,9 +38,13 @@ export interface WalletProvider {
 
 export interface ArenaPositionRaw {
   margin: bigint;
+  weight: bigint;
   leverage: bigint;
   entryPriceE8: bigint;
   isOpen: boolean;
+  pnl: bigint;
+  equity: bigint;
+  maintenanceMargin: bigint;
 }
 
 export function getEthereumProvider(): WalletProvider | null {

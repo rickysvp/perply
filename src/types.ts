@@ -10,6 +10,9 @@ export interface Position {
   amount: number;
   entryPrice: number;
   leverage: number;
+  onchainPnl?: number;
+  onchainEquity?: number;
+  maintenanceMargin?: number;
 }
 
 export interface UserPositions {
