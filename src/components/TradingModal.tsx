@@ -112,7 +112,9 @@ export default function TradingModal({
           <div className="space-y-2">
             <div className="flex justify-between items-center">
               <label className="text-[10px] text-zinc-500 font-black uppercase tracking-widest">Bet Amount (Margin)</label>
-              <span className="text-[10px] text-zinc-400 font-mono">Available: {userBalance.toLocaleString()} $MON</span>
+              <span className="text-[10px] text-zinc-400 font-mono">
+                Available: {userBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} $MON
+              </span>
             </div>
             <div className="relative group">
               <input

@@ -28,6 +28,7 @@ import {
 
 const DEFAULT_PRICE = 64289.40;
 const DEFAULT_BALANCE = 0;
+const MIN_DEPOSIT_MON = 10;
 const PRICE_HISTORY_POINTS = 40;
 const MARKET_POLL_MS = 3000;
 const DEFAULT_PYTH_BTC_PRICE_ID = '0xe62df6c8b4a85fe1fef3f1a6d5af3f4820553a4f8f8036f2fa14de3cd59adf04';
@@ -215,6 +216,13 @@ export default function App() {
     return new Intl.NumberFormat('en-US', { maximumFractionDigits: maxFractionDigits }).format(val);
   };
 
+  const formatFixedAmount = (val: number, fractionDigits = 2) => {
+    return new Intl.NumberFormat('en-US', {
+      minimumFractionDigits: fractionDigits,
+      maximumFractionDigits: fractionDigits
+    }).format(val);
+  };
+
   const parseAmountInput = (raw: string | null): number | null => {
     if (raw === null) return null;
     const normalized = raw.trim().replace(',', '.');
@@ -252,6 +260,14 @@ export default function App() {
       minute: '2-digit',
       second: '2-digit'
     });
+  };
+
+  const parseEventOrder = (id: string): number => {
+    const [blockRaw, idxRaw] = id.split('-');
+    const block = Number(blockRaw);
+    const idx = Number(idxRaw ?? '0');
+    if (!Number.isFinite(block)) return 0;
+    return block * 1_000_000 + (Number.isFinite(idx) ? idx : 0);
   };
 
   const refreshArenaHistory = async (provider: ethers.JsonRpcProvider, contract: ethers.Contract) => {
@@ -400,16 +416,26 @@ export default function App() {
     try {
       const readProvider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
       const readContract = new ethers.Contract(arenaAddress, PERPLY_ARENA_ABI, readProvider);
+      const emptyPosition = {
+        margin: 0n,
+        weight: 0n,
+        leverage: 0n,
+        entryPriceE8: 0n,
+        isOpen: false,
+        pnl: 0n,
+        equity: 0n,
+        maintenanceMargin: 0n
+      };
       const [
-        available,
-        longPos,
-        shortPos,
-        congestionRates,
-        longRewards,
-        shortRewards,
-        longWeight,
-        shortWeight
-      ] = await Promise.all([
+        availableResult,
+        longPosResult,
+        shortPosResult,
+        congestionRatesResult,
+        longRewardsResult,
+        shortRewardsResult,
+        longWeightResult,
+        shortWeightResult
+      ] = await Promise.allSettled([
         readContract.availableBalance(trader) as Promise<bigint>,
         readContract.getPosition(trader, 0) as Promise<{
           margin: bigint;
@@ -454,6 +480,38 @@ export default function App() {
         readContract.markPriceE8() as Promise<bigint>
       ]);
 
+      const requiredResults = [
+        availableResult,
+        longPosResult,
+        shortPosResult,
+        congestionRatesResult,
+        longRewardsResult,
+        shortRewardsResult,
+        longWeightResult,
+        shortWeightResult
+      ];
+      const allRequiredReadsFailed = requiredResults.every(result => result.status === 'rejected');
+      if (allRequiredReadsFailed) {
+        setWalletError('Cannot read arena contract. Verify contract address and Monad testnet network.');
+        setUserBalance(DEFAULT_BALANCE);
+        setUserPositions({ long: null, short: null });
+        setAllianceLiquidity(0);
+        setSyndicateLiquidity(0);
+        setDominance(0);
+        setRecentSettlements([]);
+        setRecentCongestionFees([]);
+        return;
+      }
+
+      const available = availableResult.status === 'fulfilled' ? availableResult.value : 0n;
+      const longPos = longPosResult.status === 'fulfilled' ? longPosResult.value : emptyPosition;
+      const shortPos = shortPosResult.status === 'fulfilled' ? shortPosResult.value : emptyPosition;
+      const congestionRates = congestionRatesResult.status === 'fulfilled' ? congestionRatesResult.value : [0n, 0n];
+      const longRewards = longRewardsResult.status === 'fulfilled' ? longRewardsResult.value : 0n;
+      const shortRewards = shortRewardsResult.status === 'fulfilled' ? shortRewardsResult.value : 0n;
+      const longWeight = longWeightResult.status === 'fulfilled' ? longWeightResult.value : 0n;
+      const shortWeight = shortWeightResult.status === 'fulfilled' ? shortWeightResult.value : 0n;
+
       setUserBalance(Number(ethers.formatEther(available)));
       setUserPositions({
         long: mapOnchainPosition(longPos, 'long'),
@@ -466,6 +524,8 @@ export default function App() {
       setVolatilityTriggerPct(volTriggerBpsResult.status === 'fulfilled' ? Number(volTriggerBpsResult.value) / 100 : 0.15);
       if (markPriceResult.status === 'fulfilled') {
         setOnchainMarkPrice(fromPriceE8(markPriceResult.value));
+      } else {
+        setOnchainMarkPrice(null);
       }
       setLongCongestionRateBps(Number(congestionRates[0]));
       setShortCongestionRateBps(Number(congestionRates[1]));
@@ -480,12 +540,7 @@ export default function App() {
       await refreshArenaHistory(readProvider, readContract);
       setWalletError(null);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to load on-chain state';
-      if (message.includes('CALL_EXCEPTION') || message.includes('missing revert data')) {
-        setWalletError('Some on-chain stats are temporarily unavailable. Please retry.');
-        return;
-      }
-      setWalletError(message);
+      setWalletError(toReadableError(error, 'Failed to load on-chain state'));
     }
   };
 
@@ -526,9 +581,13 @@ export default function App() {
       setWalletError('Connect wallet first');
       return;
     }
-    const input = window.prompt('Deposit MON amount', '1');
+    const input = window.prompt(`Deposit MON amount (min ${MIN_DEPOSIT_MON})`, `${MIN_DEPOSIT_MON}`);
     const amount = parseAmountInput(input);
     if (!amount) return;
+    if (amount < MIN_DEPOSIT_MON) {
+      setWalletError(`Minimum deposit is ${MIN_DEPOSIT_MON} MON`);
+      return;
+    }
 
     try {
       setIsTxPending(true);
@@ -565,7 +624,7 @@ export default function App() {
     const amount = parseAmountInput(input);
     if (!amount) return;
     if (amount > userBalance) {
-      setWalletError(`Insufficient contract available balance: ${formatAmount(userBalance, 4)} MON`);
+      setWalletError(`Insufficient contract available balance: ${formatFixedAmount(userBalance, 2)} MON`);
       return;
     }
 
@@ -776,27 +835,46 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    const mapped = recentSettlements
+    const settlementRecords = recentSettlements
       .filter(item => item.winner !== 'NONE' && item.winnerNet > 0)
-      .map(item => {
-        const [blockRaw, idxRaw] = item.id.split('-');
-        const blockNum = Number(blockRaw);
-        const idxNum = Number(idxRaw ?? '0');
-        return {
-          id: Number.isFinite(blockNum) ? (blockNum * 1000 + idxNum) : Date.now() + idxNum,
+      .map(item => ({
+        sort: parseEventOrder(item.id),
+        record: {
+          id: `settle-${item.id}`,
           faction: item.winner === 'LONG' ? 'left' as const : 'right' as const,
           amount: formatAmount(item.winnerNet, 4),
-          time: item.time
-        };
-      });
+          time: item.time,
+          kind: 'settlement' as const,
+          label: 'SETTLE'
+        }
+      }));
 
-    setBattleHistory(mapped);
-    if (mapped.length > 0) {
-      setLatestPnL({ faction: mapped[0].faction, amount: mapped[0].amount });
+    const congestionRecords = recentCongestionFees
+      .filter(item => item.toOpposite > 0)
+      .map(item => ({
+        sort: parseEventOrder(item.id),
+        record: {
+          id: `congestion-${item.id}`,
+          faction: item.side === 'LONG' ? 'right' as const : 'left' as const,
+          amount: formatAmount(item.toOpposite, 4),
+          time: item.time,
+          kind: 'congestion' as const,
+          label: 'CONGEST'
+        }
+      }));
+
+    const merged = [...settlementRecords, ...congestionRecords]
+      .sort((a, b) => b.sort - a.sort)
+      .slice(0, 24)
+      .map(item => item.record);
+
+    setBattleHistory(merged);
+    if (merged.length > 0) {
+      setLatestPnL({ faction: merged[0].faction, amount: merged[0].amount });
     } else {
       setLatestPnL(null);
     }
-  }, [recentSettlements]);
+  }, [recentSettlements, recentCongestionFees]);
 
   const getOpenPreview = async (side: 'long' | 'short', margin: number, leverage: number): Promise<OpenPreview | null> => {
     if (!arenaAddress || margin <= 0 || leverage <= 0) return null;
@@ -1008,7 +1086,7 @@ export default function App() {
                 <div className="hidden lg:flex items-center space-x-6 border-r border-white/10 pr-6 bg-black/70 px-4 py-2 rounded backdrop-blur-sm">
                   <div className="flex flex-col items-end">
                     <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest font-mono">Balance</span>
-                    <span className="text-[14px] font-bold text-white font-mono">{formatAmount(userBalance, 4)} <span className="font-mono text-[11px]">$MON</span></span>
+                    <span className="text-[14px] font-bold text-white font-mono">{formatFixedAmount(userBalance, 2)} <span className="font-mono text-[11px]">$MON</span></span>
                   </div>
                   <div className="flex flex-col items-end">
                     <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest font-mono">Margin</span>
@@ -1104,7 +1182,7 @@ export default function App() {
                       <div className="grid grid-cols-2 gap-4">
                         <div className="p-3 bg-white/5 rounded-sm border border-white/5">
                           <div className="text-[8px] text-zinc-500 uppercase font-bold mb-1">Available</div>
-                          <div className="text-xs font-mono font-bold text-white">{formatAmount(userBalance, 4)} <span className="text-[8px] text-zinc-500">$MON</span></div>
+                          <div className="text-xs font-mono font-bold text-white">{formatFixedAmount(userBalance, 2)} <span className="text-[8px] text-zinc-500">$MON</span></div>
                         </div>
                         <div className="p-3 bg-white/5 rounded-sm border border-white/5">
                           <div className="text-[8px] text-zinc-500 uppercase font-bold mb-1">Margin Locked</div>
@@ -1143,20 +1221,24 @@ export default function App() {
                       >
                         Withdraw Assets
                       </button>
-                      <button
-                        onClick={handleSyncOnchainPrice}
-                        disabled={isTxPending || !isKeeperAuthorized}
-                        className="w-full py-2 bg-neon-green/10 hover:bg-neon-green/20 border border-neon-green/30 rounded-sm text-[9px] text-neon-green font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-                      >
-                        Run Settlement Tick
-                      </button>
-                      <button
-                        onClick={() => setIsAutoKeeperEnabled(prev => !prev)}
-                        disabled={isTxPending || !isKeeperAuthorized}
-                        className="w-full py-2 bg-neon-yellow/10 hover:bg-neon-yellow/20 border border-neon-yellow/30 rounded-sm text-[9px] text-neon-yellow font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-                      >
-                        {isAutoKeeperEnabled ? 'Auto Keeper: ON' : 'Auto Keeper: OFF'}
-                      </button>
+                      {isKeeperAuthorized && (
+                        <>
+                          <button
+                            onClick={handleSyncOnchainPrice}
+                            disabled={isTxPending}
+                            className="w-full py-2 bg-neon-green/10 hover:bg-neon-green/20 border border-neon-green/30 rounded-sm text-[9px] text-neon-green font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                          >
+                            Run Settlement Tick
+                          </button>
+                          <button
+                            onClick={() => setIsAutoKeeperEnabled(prev => !prev)}
+                            disabled={isTxPending}
+                            className="w-full py-2 bg-neon-yellow/10 hover:bg-neon-yellow/20 border border-neon-yellow/30 rounded-sm text-[9px] text-neon-yellow font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                          >
+                            {isAutoKeeperEnabled ? 'Auto Keeper: ON' : 'Auto Keeper: OFF'}
+                          </button>
+                        </>
+                      )}
                       <button
                         onClick={handleDisconnect}
                         className="w-full py-2 hover:bg-crimson-red/10 rounded-sm text-[9px] text-zinc-500 hover:text-crimson-red font-black uppercase tracking-widest transition-all text-center"
@@ -1266,7 +1348,7 @@ export default function App() {
                   On-chain Mark: {onchainMarkPrice ? formatCurrency(onchainMarkPrice) : 'N/A'}
                 </div>
                 <div className="mt-1 text-[8px] text-zinc-500 font-mono tracking-wider z-10">
-                  Tick: {minSettlementIntervalSec}s | Trigger: {volatilityTriggerPct.toFixed(2)}% | Keeper: {isAutoKeeperEnabled ? 'AUTO' : 'MANUAL'}
+                  Tick: {minSettlementIntervalSec}s | Trigger: {volatilityTriggerPct.toFixed(2)}% | Keeper: {isKeeperAuthorized ? (isAutoKeeperEnabled ? 'AUTO' : 'MANUAL') : 'SYSTEM'}
                 </div>
               </div>
 
@@ -1325,7 +1407,7 @@ export default function App() {
                   </div>
                   <div className="overflow-y-auto h-full scrollbar-none group-hover:scrollbar-thin scrollbar-thumb-neon-blue/20 px-2 pb-6 space-y-0.5">
                     {battleHistory.length === 0 ? (
-                      <div className="text-[8px] text-zinc-700 font-mono text-center py-4 tracking-widest uppercase">Initializing Stream...</div>
+                      <div className="text-[8px] text-zinc-700 font-mono text-center py-4 tracking-widest uppercase">No Battle Events Yet</div>
                     ) : (
                       battleHistory.map((record) => (
                         <div key={record.id} className="flex justify-between items-center text-[8px] font-mono py-0.5 border-b border-white/5 last:border-0 group/item hover:bg-white/5 transition-colors">
@@ -1333,6 +1415,9 @@ export default function App() {
                             <span className="text-zinc-600 text-[7px]">{record.time}</span>
                             <span className={`font-bold tracking-tighter ${record.faction === 'left' ? 'text-neon-green neon-text-glow-green' : 'text-crimson-red neon-text-glow-red'}`}>
                               {record.faction === 'left' ? 'ALLIANCE' : 'SYNDICATE'}
+                            </span>
+                            <span className="text-[6px] px-1 py-[1px] rounded border border-white/10 text-zinc-400 tracking-widest">
+                              {record.label}
                             </span>
                           </div>
                           <span className="text-white/90 font-bold group-hover/item:text-white transition-colors">+{record.amount}</span>
@@ -1349,8 +1434,8 @@ export default function App() {
               <div className="bg-black/70 border border-white/10 backdrop-blur-md rounded-lg p-3 space-y-3 shadow-[0_0_25px_rgba(0,0,0,0.5)]">
                 <div className="flex items-center justify-between">
                   <span className="text-[9px] uppercase tracking-[0.2em] text-zinc-400 font-bold">Settlement Feed</span>
-                  <span className={`text-[8px] font-mono ${isAutoKeeperEnabled ? 'text-neon-green' : 'text-zinc-500'}`}>
-                    {isAutoKeeperEnabled ? 'AUTO' : 'MANUAL'}
+                  <span className={`text-[8px] font-mono ${isKeeperAuthorized ? (isAutoKeeperEnabled ? 'text-neon-green' : 'text-zinc-500') : 'text-zinc-500'}`}>
+                    {isKeeperAuthorized ? (isAutoKeeperEnabled ? 'AUTO' : 'MANUAL') : 'SYSTEM'}
                   </span>
                 </div>
                 <div className="space-y-1 max-h-32 overflow-y-auto scrollbar-none">

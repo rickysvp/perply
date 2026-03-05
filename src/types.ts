@@ -1,8 +1,10 @@
 export interface BattleRecord {
-  id: number;
+  id: string;
   faction: 'left' | 'right';
   amount: string;
   time: string;
+  kind: 'settlement' | 'congestion';
+  label: string;
 }
 
 export interface Position {
