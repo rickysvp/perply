@@ -5,34 +5,28 @@
 
 import { useState, useEffect, useMemo } from 'react';
 import React from 'react';
+import { ethers } from 'ethers';
 import { Zap, Wallet, ChevronDown, ChevronUp, TrendingUp, TrendingDown } from 'lucide-react';
 import BattleCanvas from './components/BattleCanvas';
 import TradingModal from './components/TradingModal';
 
 import { BattleRecord, UserPositions, Position } from './types';
+import {
+  ensureMonadTestnet,
+  fromPriceE8,
+  getArenaAddress,
+  getEthereumProvider,
+  MONAD_TESTNET,
+  PERPLY_ARENA_ABI,
+  shortenAddress,
+  toPriceE8
+} from './web3/perplyArena';
 
 const DEFAULT_PRICE = 64289.40;
-const DEFAULT_BALANCE = 24592.40;
+const DEFAULT_BALANCE = 0;
 const PRICE_HISTORY_POINTS = 40;
 const MARKET_POLL_MS = 3000;
 const TRADING_FEE_RATE = 0.001;
-
-interface WalletProvider {
-  request: (args: { method: string; params?: unknown[] | Record<string, unknown> }) => Promise<unknown>;
-  on?: (event: string, listener: (...args: unknown[]) => void) => void;
-  removeListener?: (event: string, listener: (...args: unknown[]) => void) => void;
-}
-
-function getEthereumProvider(): WalletProvider | null {
-  if (typeof window === 'undefined') return null;
-  const provider = (window as Window & { ethereum?: WalletProvider }).ethereum;
-  return provider ?? null;
-}
-
-function shortenAddress(address: string | null): string {
-  if (!address) return '';
-  return `${address.slice(0, 6)}...${address.slice(-4)}`;
-}
 
 async function fetchBtcPrice(): Promise<number | null> {
   try {
@@ -73,6 +67,8 @@ export default function App() {
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   const [walletError, setWalletError] = useState<string | null>(null);
   const [priceFeedStatus, setPriceFeedStatus] = useState<'live' | 'degraded'>('live');
+  const [isTxPending, setIsTxPending] = useState(false);
+  const [onchainMarkPrice, setOnchainMarkPrice] = useState<number | null>(null);
   const [showWalletMenu, setShowWalletMenu] = useState(false);
   const [isTradingModalOpen, setIsTradingModalOpen] = useState(false);
   const [tradingSide, setTradingSide] = useState<'long' | 'short'>('long');
@@ -82,34 +78,13 @@ export default function App() {
     long: null,
     short: null
   });
+  const arenaAddress = getArenaAddress();
+  const isContractConfigured = Boolean(arenaAddress);
   const isWalletConnected = walletAddress !== null;
   const walletLabel = shortenAddress(walletAddress);
 
   const formatCurrency = (val: number) => {
     return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(val);
-  };
-
-  const connectWallet = async () => {
-    const provider = getEthereumProvider();
-    if (!provider) {
-      setWalletError('MetaMask not detected');
-      return;
-    }
-
-    try {
-      const accounts = await provider.request({ method: 'eth_requestAccounts' }) as string[];
-      if (!accounts?.length) {
-        setWalletError('No wallet account authorized');
-        return;
-      }
-
-      setWalletAddress(accounts[0]);
-      setWalletError(null);
-      setShowWalletMenu(false);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Wallet connection failed';
-      setWalletError(message);
-    }
   };
 
   // Calculate unrealized PnL for a position
@@ -139,25 +114,167 @@ export default function App() {
     return (userPositions.long?.amount || 0) + (userPositions.short?.amount || 0);
   }, [userPositions]);
 
+  const mapOnchainPosition = (
+    raw: { margin: bigint; leverage: bigint; entryPriceE8: bigint; isOpen: boolean },
+    side: 'long' | 'short'
+  ): Position | null => {
+    if (!raw.isOpen) return null;
+    return {
+      side,
+      amount: Number(ethers.formatEther(raw.margin)),
+      entryPrice: fromPriceE8(raw.entryPriceE8),
+      leverage: Number(raw.leverage)
+    };
+  };
+
+  const getWriteContract = async () => {
+    const provider = getEthereumProvider();
+    if (!provider) throw new Error('Wallet provider not found');
+    if (!arenaAddress) throw new Error('Missing VITE_PERPLY_ARENA_ADDRESS');
+    await ensureMonadTestnet(provider);
+    const browserProvider = new ethers.BrowserProvider(provider);
+    const signer = await browserProvider.getSigner();
+    return new ethers.Contract(arenaAddress, PERPLY_ARENA_ABI, signer);
+  };
+
+  const refreshOnchainState = async (addressOverride?: string) => {
+    const trader = addressOverride ?? walletAddress;
+    if (!trader || !arenaAddress) {
+      setUserBalance(DEFAULT_BALANCE);
+      setUserPositions({ long: null, short: null });
+      return;
+    }
+
+    try {
+      const readProvider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
+      const readContract = new ethers.Contract(arenaAddress, PERPLY_ARENA_ABI, readProvider);
+      const [available, longPos, shortPos, markPrice] = await Promise.all([
+        readContract.availableBalance(trader) as Promise<bigint>,
+        readContract.getPosition(trader, 0) as Promise<{ margin: bigint; leverage: bigint; entryPriceE8: bigint; isOpen: boolean }>,
+        readContract.getPosition(trader, 1) as Promise<{ margin: bigint; leverage: bigint; entryPriceE8: bigint; isOpen: boolean }>,
+        readContract.markPriceE8() as Promise<bigint>
+      ]);
+
+      setUserBalance(Number(ethers.formatEther(available)));
+      setUserPositions({
+        long: mapOnchainPosition(longPos, 'long'),
+        short: mapOnchainPosition(shortPos, 'short')
+      });
+      setOnchainMarkPrice(fromPriceE8(markPrice));
+      setWalletError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to load on-chain state';
+      setWalletError(message);
+    }
+  };
+
+  const connectWallet = async () => {
+    const provider = getEthereumProvider();
+    if (!provider) {
+      setWalletError('MetaMask not detected');
+      return;
+    }
+    if (!isContractConfigured) {
+      setWalletError('Set VITE_PERPLY_ARENA_ADDRESS first');
+      return;
+    }
+
+    try {
+      await ensureMonadTestnet(provider);
+      const accounts = await provider.request({ method: 'eth_requestAccounts' }) as string[];
+      if (!accounts?.length) {
+        setWalletError('No wallet account authorized');
+        return;
+      }
+
+      setWalletAddress(accounts[0]);
+      setWalletError(null);
+      setShowWalletMenu(false);
+      await refreshOnchainState(accounts[0]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Wallet connection failed';
+      setWalletError(message);
+    }
+  };
+
+  const handleDeposit = async () => {
+    if (!isWalletConnected) return;
+    const input = window.prompt('Deposit MON amount', '1');
+    if (!input) return;
+    const amount = Number(input);
+    if (!Number.isFinite(amount) || amount <= 0) return;
+
+    try {
+      setIsTxPending(true);
+      const contract = await getWriteContract();
+      const tx = await contract.deposit({ value: ethers.parseEther(amount.toString()) });
+      await tx.wait();
+      await refreshOnchainState();
+      setShowWalletMenu(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Deposit failed';
+      setWalletError(message);
+    } finally {
+      setIsTxPending(false);
+    }
+  };
+
+  const handleWithdraw = async () => {
+    if (!isWalletConnected) return;
+    const input = window.prompt('Withdraw MON amount', '1');
+    if (!input) return;
+    const amount = Number(input);
+    if (!Number.isFinite(amount) || amount <= 0) return;
+
+    try {
+      setIsTxPending(true);
+      const contract = await getWriteContract();
+      const tx = await contract.withdraw(ethers.parseEther(amount.toString()));
+      await tx.wait();
+      await refreshOnchainState();
+      setShowWalletMenu(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Withdraw failed';
+      setWalletError(message);
+    } finally {
+      setIsTxPending(false);
+    }
+  };
+
+  const handleSyncOnchainPrice = async () => {
+    if (!isWalletConnected) return;
+    try {
+      setIsTxPending(true);
+      const contract = await getWriteContract();
+      const tx = await contract.setMarkPrice(toPriceE8(price));
+      await tx.wait();
+      await refreshOnchainState();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Mark price update failed';
+      setWalletError(message);
+    } finally {
+      setIsTxPending(false);
+    }
+  };
+
   // Detect wallet session on load
   useEffect(() => {
     const provider = getEthereumProvider();
     if (!provider) return;
-
     provider.request({ method: 'eth_accounts' })
       .then(result => {
         const accounts = Array.isArray(result) ? result as string[] : [];
         if (accounts.length > 0) {
           setWalletAddress(accounts[0]);
-          setWalletError(null);
+          void refreshOnchainState(accounts[0]);
         }
       })
       .catch(() => {
-        // Ignore passive session check errors.
+        // ignore passive wallet detection errors
       });
   }, []);
 
-  // Track wallet account switching from provider events.
+  // Track wallet account and network switching from provider events.
   useEffect(() => {
     const provider = getEthereumProvider();
     if (!provider?.on) return;
@@ -167,58 +284,28 @@ export default function App() {
       if (accounts.length > 0) {
         setWalletAddress(accounts[0]);
         setWalletError(null);
+        void refreshOnchainState(accounts[0]);
       } else {
         setWalletAddress(null);
         setShowWalletMenu(false);
+        setUserBalance(DEFAULT_BALANCE);
+        setUserPositions({ long: null, short: null });
+      }
+    };
+
+    const onChainChanged = () => {
+      if (walletAddress) {
+        void refreshOnchainState(walletAddress);
       }
     };
 
     provider.on('accountsChanged', onAccountsChanged);
+    provider.on('chainChanged', onChainChanged);
     return () => {
       provider.removeListener?.('accountsChanged', onAccountsChanged);
+      provider.removeListener?.('chainChanged', onChainChanged);
     };
-  }, []);
-
-  // Load/persist account-scoped demo portfolio.
-  useEffect(() => {
-    if (!walletAddress) {
-      setUserBalance(DEFAULT_BALANCE);
-      setUserPositions({ long: null, short: null });
-      return;
-    }
-
-    const storageKey = `perply-v1-wallet:${walletAddress.toLowerCase()}`;
-    const saved = localStorage.getItem(storageKey);
-    if (!saved) {
-      setUserBalance(DEFAULT_BALANCE);
-      setUserPositions({ long: null, short: null });
-      return;
-    }
-
-    try {
-      const parsed = JSON.parse(saved) as {
-        balance?: number;
-        positions?: UserPositions;
-      };
-      setUserBalance(typeof parsed.balance === 'number' ? parsed.balance : DEFAULT_BALANCE);
-      setUserPositions({
-        long: parsed.positions?.long ?? null,
-        short: parsed.positions?.short ?? null
-      });
-    } catch {
-      setUserBalance(DEFAULT_BALANCE);
-      setUserPositions({ long: null, short: null });
-    }
   }, [walletAddress]);
-
-  useEffect(() => {
-    if (!walletAddress) return;
-    const storageKey = `perply-v1-wallet:${walletAddress.toLowerCase()}`;
-    localStorage.setItem(storageKey, JSON.stringify({
-      balance: userBalance,
-      positions: userPositions
-    }));
-  }, [walletAddress, userBalance, userPositions]);
 
   // Live market data loop (primary: Binance, fallback: CoinGecko)
   useEffect(() => {
@@ -302,48 +389,67 @@ export default function App() {
     setWalletAddress(null);
     setWalletError(null);
     setShowWalletMenu(false);
+    setUserBalance(DEFAULT_BALANCE);
+    setUserPositions({ long: null, short: null });
   };
 
-  const handleBet = (side: 'long' | 'short') => {
+  const handleBet = async (side: 'long' | 'short') => {
     if (!isWalletConnected) {
       void connectWallet();
+      return;
+    }
+    if (!isContractConfigured) {
+      setWalletError('Set VITE_PERPLY_ARENA_ADDRESS first');
       return;
     }
 
     const existingPosition = side === 'long' ? userPositions.long : userPositions.short;
 
     if (existingPosition) {
-      const pnl = calculatePnL(existingPosition);
-      setUserBalance(prev => prev + existingPosition.amount + pnl);
-      setUserPositions(prev => ({
-        ...prev,
-        [side]: null
-      }));
-    } else {
-      setTradingSide(side);
-      setIsTradingModalOpen(true);
+      try {
+        setIsTxPending(true);
+        const contract = await getWriteContract();
+        const sideId = side === 'long' ? 0 : 1;
+        const tx = await contract.closePosition(sideId);
+        await tx.wait();
+        await refreshOnchainState();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Close position failed';
+        setWalletError(message);
+      } finally {
+        setIsTxPending(false);
+      }
+      return;
     }
+
+    setTradingSide(side);
+    setIsTradingModalOpen(true);
   };
 
-  const confirmTrading = (margin: number, leverage: number) => {
+  const confirmTrading = async (margin: number, leverage: number) => {
+    if (!isWalletConnected || !isContractConfigured) return;
+
     const positionSize = margin * leverage;
     const fee = positionSize * TRADING_FEE_RATE;
-
     if (margin <= 0 || margin + fee > userBalance) {
       return;
     }
 
-    setUserBalance(prev => prev - margin - fee);
-    setUserPositions(prev => ({
-      ...prev,
-      [tradingSide]: {
-        side: tradingSide,
-        amount: margin,
-        entryPrice: price,
-        leverage: leverage
-      }
-    }));
-    setIsTradingModalOpen(false);
+    try {
+      setIsTxPending(true);
+      const contract = await getWriteContract();
+      const sideId = tradingSide === 'long' ? 0 : 1;
+      const marginWei = ethers.parseEther(margin.toString());
+      const tx = await contract.openPosition(sideId, marginWei, leverage);
+      await tx.wait();
+      setIsTradingModalOpen(false);
+      await refreshOnchainState();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Open position failed';
+      setWalletError(message);
+    } finally {
+      setIsTxPending(false);
+    }
   };
 
   // Render position info card
@@ -449,14 +555,17 @@ export default function App() {
               <div className="relative">
                 <button
                   onClick={handleWalletClick}
+                  disabled={isTxPending}
                   className={`h-8 px-4 rounded-sm border text-[10px] font-mono uppercase tracking-[0.2em] transition-all relative group overflow-hidden flex items-center space-x-2 ${
                     isWalletConnected
                     ? 'border-neon-blue/50 text-neon-blue bg-neon-blue/5'
                     : 'border-white/20 text-white hover:border-neon-blue hover:bg-neon-blue/5'
-                  }`}
+                  } ${isTxPending ? 'opacity-70 cursor-not-allowed' : ''}`}
                 >
                   <div className="absolute inset-0 bg-neon-blue/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>
-                  <span className="relative z-10">{isWalletConnected ? walletLabel : 'Connect Wallet'}</span>
+                  <span className="relative z-10">
+                    {isTxPending ? 'Pending Tx...' : (isWalletConnected ? walletLabel : 'Connect Wallet')}
+                  </span>
                   {isWalletConnected && (
                     <div className="relative z-10">
                       {showWalletMenu ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
@@ -465,6 +574,11 @@ export default function App() {
                 </button>
                 {walletError && (
                   <div className="absolute right-0 mt-2 text-[8px] text-crimson-red font-mono whitespace-nowrap">{walletError}</div>
+                )}
+                {!isContractConfigured && (
+                  <div className="absolute right-0 mt-2 text-[8px] text-neon-yellow font-mono whitespace-nowrap">
+                    Missing VITE_PERPLY_ARENA_ADDRESS
+                  </div>
                 )}
 
                 {/* Wallet Dropdown */}
@@ -514,8 +628,26 @@ export default function App() {
                     </div>
 
                     <div className="px-5 py-3 bg-white/5 border-t border-white/5 flex flex-col space-y-2">
-                      <button className="w-full py-2 bg-neon-blue/10 hover:bg-neon-blue/20 border border-neon-blue/30 rounded-sm text-[9px] text-neon-blue font-black uppercase tracking-widest transition-all">
+                      <button
+                        onClick={handleDeposit}
+                        disabled={isTxPending}
+                        className="w-full py-2 bg-neon-blue/10 hover:bg-neon-blue/20 border border-neon-blue/30 rounded-sm text-[9px] text-neon-blue font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                      >
                         Deposit Assets
+                      </button>
+                      <button
+                        onClick={handleWithdraw}
+                        disabled={isTxPending}
+                        className="w-full py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-sm text-[9px] text-white font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                      >
+                        Withdraw Assets
+                      </button>
+                      <button
+                        onClick={handleSyncOnchainPrice}
+                        disabled={isTxPending}
+                        className="w-full py-2 bg-neon-green/10 hover:bg-neon-green/20 border border-neon-green/30 rounded-sm text-[9px] text-neon-green font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                      >
+                        Sync Price On-Chain
                       </button>
                       <button
                         onClick={handleDisconnect}
@@ -597,6 +729,9 @@ export default function App() {
                   }`}>
                     {priceFeedStatus === 'live' ? 'LIVE' : 'DEGRADED'}
                   </span>
+                  <span className="text-[7px] px-1.5 py-0.5 rounded border ml-1 bg-white/5 text-zinc-300 border-white/15">
+                    MONAD #{MONAD_TESTNET.chainId}
+                  </span>
                 </div>
                 <div className={`text-3xl md:text-5xl font-black font-mono tracking-tight transition-colors z-10 ${trend === 'bull' ? 'text-neon-green' : 'text-crimson-red'} ${isGlitching ? 'animate-glitch' : ''}`}>
                   {price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
@@ -607,34 +742,39 @@ export default function App() {
                 <div className={`mt-2 md:mt-3 px-2 md:px-3 py-1 text-white text-[8px] md:text-[10px] font-bold rounded animate-pulse z-10 ${trend === 'bull' ? 'bg-neon-green/80' : 'bg-crimson-red/80'}`}>
                   {trend === 'bull' ? 'BULLISH MOMENTUM' : 'BEARISH PRESSURE'}
                 </div>
+                <div className="mt-2 text-[8px] text-zinc-400 font-mono tracking-wider z-10">
+                  On-chain Mark: {onchainMarkPrice ? formatCurrency(onchainMarkPrice) : 'N/A'}
+                </div>
               </div>
 
               {/* Betting Controls */}
               <div className="mt-8 flex items-center space-x-4 z-40">
                 <button
-                  onClick={() => handleBet('long')}
+                  onClick={() => void handleBet('long')}
+                  disabled={isTxPending}
                   className={`flex items-center space-x-3 px-8 py-4 rounded-xl font-black uppercase tracking-widest transition-all duration-300 border-2 ${
                     userPositions.long
                     ? 'bg-neon-green text-black border-neon-green shadow-[0_0_30px_rgba(57,255,20,0.5)] scale-105'
                     : 'bg-black/60 text-neon-green border-neon-green/40 hover:bg-neon-green/10 hover:shadow-[0_0_20px_rgba(57,255,20,0.2)]'
-                  }`}
+                  } ${isTxPending ? 'opacity-60 cursor-not-allowed' : ''}`}
                   style={{ fontFamily: "'Orbitron', sans-serif" }}
                 >
                   <TrendingUp size={20} />
-                  <span>{userPositions.long ? 'CLOSE LONG' : 'LONG'}</span>
+                  <span>{isTxPending ? 'PENDING...' : (userPositions.long ? 'CLOSE LONG' : 'LONG')}</span>
                 </button>
 
                 <button
-                  onClick={() => handleBet('short')}
+                  onClick={() => void handleBet('short')}
+                  disabled={isTxPending}
                   className={`flex items-center space-x-3 px-8 py-4 rounded-xl font-black uppercase tracking-widest transition-all duration-300 border-2 ${
                     userPositions.short
                     ? 'bg-crimson-red text-white border-crimson-red shadow-[0_0_30px_rgba(255,0,60,0.5)] scale-105'
                     : 'bg-black/60 text-crimson-red border-crimson-red/40 hover:bg-crimson-red/10 hover:shadow-[0_0_20px_rgba(255,0,60,0.2)]'
-                  }`}
+                  } ${isTxPending ? 'opacity-60 cursor-not-allowed' : ''}`}
                   style={{ fontFamily: "'Orbitron', sans-serif" }}
                 >
                   <TrendingDown size={20} />
-                  <span>{userPositions.short ? 'CLOSE SHORT' : 'SHORT'}</span>
+                  <span>{isTxPending ? 'PENDING...' : (userPositions.short ? 'CLOSE SHORT' : 'SHORT')}</span>
                 </button>
               </div>
             </div>

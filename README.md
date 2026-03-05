@@ -1,20 +1,65 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Perply.fun V1 (Frontend + Smart Contract)
 
-# Run and deploy your AI Studio app
+Web3 perpetual battle arena MVP on Monad testnet.
 
-This contains everything you need to run your app locally.
+- Frontend: React + Vite
+- Smart contract: Solidity + Foundry
+- No backend required for trading flow
 
-View your app in AI Studio: https://ai.studio/apps/6ad53f7a-5863-4eb3-91f3-4ecf78eeed85
+## Monad Testnet Settings
 
-## Run Locally
+- Chain Name: `Monad Testnet`
+- Chain ID: `10143`
+- RPC URL: `https://testnet-rpc.monad.xyz`
+- Explorer: `https://testnet.monadexplorer.com`
 
-**Prerequisites:**  Node.js
+## Prerequisites
 
+1. Node.js (v20+ recommended)
+2. Foundry (`forge`)
+3. MetaMask wallet with Monad testnet configured
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Install
+
+```bash
+npm install
+```
+
+## Contract Commands
+
+Compile contract:
+
+```bash
+npm run contract:build
+```
+
+Deploy `PerplyArena` to Monad testnet:
+
+```bash
+export DEPLOYER_PRIVATE_KEY=0xyour_private_key
+export MONAD_RPC_URL=https://testnet-rpc.monad.xyz
+export INITIAL_BTC_PRICE_E8=9000000000000
+npm run contract:deploy:monad
+```
+
+## Frontend Env
+
+Create `.env.local`:
+
+```bash
+VITE_PERPLY_ARENA_ADDRESS=0xYourDeployedContractAddress
+```
+
+## Run Frontend
+
+```bash
+npm run dev
+```
+
+## V1 Features Implemented
+
+1. MetaMask wallet connect and network switch to Monad testnet
+2. On-chain `deposit` / `withdraw`
+3. On-chain `openPosition` / `closePosition` (long/short)
+4. On-chain position and balance sync in UI
+5. Manual on-chain mark price sync from frontend (owner-only tx)
