@@ -385,11 +385,6 @@ export default function App() {
       const readProvider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
       const readContract = new ethers.Contract(arenaAddress, PERPLY_ARENA_ABI, readProvider);
       const [
-        owner,
-        keeper,
-        lastSettle,
-        minInterval,
-        volTriggerBps,
         available,
         longPos,
         shortPos,
@@ -400,11 +395,6 @@ export default function App() {
         longWeight,
         shortWeight
       ] = await Promise.all([
-        readContract.owner() as Promise<string>,
-        readContract.keeper() as Promise<string>,
-        readContract.lastSettlementAt() as Promise<bigint>,
-        readContract.minSettlementInterval() as Promise<bigint>,
-        readContract.volatilityTriggerBps() as Promise<bigint>,
         readContract.availableBalance(trader) as Promise<bigint>,
         readContract.getPosition(trader, 0) as Promise<{
           margin: bigint;
@@ -434,16 +424,30 @@ export default function App() {
         readContract.sideWeight(1) as Promise<bigint>
       ]);
 
+      const [
+        ownerResult,
+        keeperResult,
+        lastSettleResult,
+        minIntervalResult,
+        volTriggerBpsResult
+      ] = await Promise.allSettled([
+        readContract.owner() as Promise<string>,
+        readContract.keeper() as Promise<string>,
+        readContract.lastSettlementAt() as Promise<bigint>,
+        readContract.minSettlementInterval() as Promise<bigint>,
+        readContract.volatilityTriggerBps() as Promise<bigint>
+      ]);
+
       setUserBalance(Number(ethers.formatEther(available)));
       setUserPositions({
         long: mapOnchainPosition(longPos, 'long'),
         short: mapOnchainPosition(shortPos, 'short')
       });
-      setContractOwner(owner);
-      setContractKeeper(keeper);
-      setLastSettlementAt(Number(lastSettle));
-      setMinSettlementIntervalSec(Number(minInterval));
-      setVolatilityTriggerPct(Number(volTriggerBps) / 100);
+      setContractOwner(ownerResult.status === 'fulfilled' ? ownerResult.value : null);
+      setContractKeeper(keeperResult.status === 'fulfilled' ? keeperResult.value : null);
+      setLastSettlementAt(lastSettleResult.status === 'fulfilled' ? Number(lastSettleResult.value) : null);
+      setMinSettlementIntervalSec(minIntervalResult.status === 'fulfilled' ? Number(minIntervalResult.value) : 10);
+      setVolatilityTriggerPct(volTriggerBpsResult.status === 'fulfilled' ? Number(volTriggerBpsResult.value) / 100 : 0.15);
       setOnchainMarkPrice(fromPriceE8(markPrice));
       setLongCongestionRateBps(Number(congestionRates[0]));
       setShortCongestionRateBps(Number(congestionRates[1]));
