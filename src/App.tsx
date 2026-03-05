@@ -160,8 +160,8 @@ export default function App() {
   const [price, setPrice] = useState(DEFAULT_PRICE);
   const [priceHistory, setPriceHistory] = useState<number[]>(Array(PRICE_HISTORY_POINTS).fill(DEFAULT_PRICE));
   const [dominance, setDominance] = useState(0);
-  const [allianceLiquidity, setAllianceLiquidity] = useState(1824042);
-  const [syndicateLiquidity, setSyndicateLiquidity] = useState(2466962);
+  const [allianceLiquidity, setAllianceLiquidity] = useState(0);
+  const [syndicateLiquidity, setSyndicateLiquidity] = useState(0);
   const [trend, setTrend] = useState<'bull' | 'bear' | 'neutral'>('neutral');
   const [latestPnL, setLatestPnL] = useState<{ faction: 'left' | 'right'; amount: string } | null>(null);
   const [battleHistory, setBattleHistory] = useState<BattleRecord[]>([]);
@@ -209,6 +209,10 @@ export default function App() {
 
   const formatCurrency = (val: number) => {
     return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(val);
+  };
+
+  const formatAmount = (val: number, maxFractionDigits = 4) => {
+    return new Intl.NumberFormat('en-US', { maximumFractionDigits: maxFractionDigits }).format(val);
   };
 
   const parseAmountInput = (raw: string | null): number | null => {
@@ -381,6 +385,9 @@ export default function App() {
       setShortCongestionRateBps(0);
       setLongCongestionRewards(0);
       setShortCongestionRewards(0);
+      setAllianceLiquidity(0);
+      setSyndicateLiquidity(0);
+      setDominance(0);
       setContractOwner(null);
       setContractKeeper(null);
       setLastSettlementAt(null);
@@ -464,8 +471,12 @@ export default function App() {
       setShortCongestionRateBps(Number(congestionRates[1]));
       setLongCongestionRewards(Number(ethers.formatEther(longRewards)));
       setShortCongestionRewards(Number(ethers.formatEther(shortRewards)));
-      setAllianceLiquidity(Number(ethers.formatEther(longWeight)));
-      setSyndicateLiquidity(Number(ethers.formatEther(shortWeight)));
+      const longLiquidity = Number(ethers.formatEther(longWeight));
+      const shortLiquidity = Number(ethers.formatEther(shortWeight));
+      setAllianceLiquidity(longLiquidity);
+      setSyndicateLiquidity(shortLiquidity);
+      const totalLiquidity = longLiquidity + shortLiquidity;
+      setDominance(totalLiquidity > 0 ? (longLiquidity - shortLiquidity) / totalLiquidity : 0);
       await refreshArenaHistory(readProvider, readContract);
       setWalletError(null);
     } catch (error) {
@@ -535,6 +546,7 @@ export default function App() {
       const tx = await contract.deposit({ value });
       await tx.wait();
       await refreshOnchainState();
+      window.setTimeout(() => { void refreshOnchainState(); }, 1200);
       setShowWalletMenu(false);
       setWalletError(null);
     } catch (error) {
@@ -553,7 +565,7 @@ export default function App() {
     const amount = parseAmountInput(input);
     if (!amount) return;
     if (amount > userBalance) {
-      setWalletError(`Insufficient contract available balance: ${formatCurrency(userBalance)} MON`);
+      setWalletError(`Insufficient contract available balance: ${formatAmount(userBalance, 4)} MON`);
       return;
     }
 
@@ -563,6 +575,7 @@ export default function App() {
       const tx = await contract.withdraw(ethers.parseEther(amount.toString()));
       await tx.wait();
       await refreshOnchainState();
+      window.setTimeout(() => { void refreshOnchainState(); }, 1200);
       setShowWalletMenu(false);
       setWalletError(null);
     } catch (error) {
@@ -701,24 +714,6 @@ export default function App() {
             }
             return nextTrend;
           });
-
-          setDominance(prevDom => {
-            const shift = delta * 0.0005;
-            let newDom = prevDom + shift;
-            if (newDom > 0.85) newDom = 0.85;
-            if (newDom < -0.85) newDom = -0.85;
-            return newDom;
-          });
-
-          const isAllianceWin = delta > 0;
-          const amount = Math.abs(delta) * 40 + (Math.random() * 250);
-          const pnl = {
-            faction: isAllianceWin ? 'left' as const : 'right' as const,
-            amount: formatCurrency(amount),
-            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-          };
-          setLatestPnL(pnl);
-          setBattleHistory(prev => [{ id: Date.now() + Math.random(), ...pnl }, ...prev].slice(0, 50));
         } else {
           setTrend('neutral');
         }
@@ -779,6 +774,29 @@ export default function App() {
     minSettlementIntervalSec,
     volatilityTriggerPct
   ]);
+
+  useEffect(() => {
+    const mapped = recentSettlements
+      .filter(item => item.winner !== 'NONE' && item.winnerNet > 0)
+      .map(item => {
+        const [blockRaw, idxRaw] = item.id.split('-');
+        const blockNum = Number(blockRaw);
+        const idxNum = Number(idxRaw ?? '0');
+        return {
+          id: Number.isFinite(blockNum) ? (blockNum * 1000 + idxNum) : Date.now() + idxNum,
+          faction: item.winner === 'LONG' ? 'left' as const : 'right' as const,
+          amount: formatAmount(item.winnerNet, 4),
+          time: item.time
+        };
+      });
+
+    setBattleHistory(mapped);
+    if (mapped.length > 0) {
+      setLatestPnL({ faction: mapped[0].faction, amount: mapped[0].amount });
+    } else {
+      setLatestPnL(null);
+    }
+  }, [recentSettlements]);
 
   const getOpenPreview = async (side: 'long' | 'short', margin: number, leverage: number): Promise<OpenPreview | null> => {
     if (!arenaAddress || margin <= 0 || leverage <= 0) return null;
@@ -990,7 +1008,7 @@ export default function App() {
                 <div className="hidden lg:flex items-center space-x-6 border-r border-white/10 pr-6 bg-black/70 px-4 py-2 rounded backdrop-blur-sm">
                   <div className="flex flex-col items-end">
                     <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest font-mono">Balance</span>
-                    <span className="text-[14px] font-bold text-white font-mono">{formatCurrency(userBalance)} <span className="font-mono text-[11px]">$MON</span></span>
+                    <span className="text-[14px] font-bold text-white font-mono">{formatAmount(userBalance, 4)} <span className="font-mono text-[11px]">$MON</span></span>
                   </div>
                   <div className="flex flex-col items-end">
                     <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest font-mono">Margin</span>
@@ -1086,7 +1104,7 @@ export default function App() {
                       <div className="grid grid-cols-2 gap-4">
                         <div className="p-3 bg-white/5 rounded-sm border border-white/5">
                           <div className="text-[8px] text-zinc-500 uppercase font-bold mb-1">Available</div>
-                          <div className="text-xs font-mono font-bold text-white">{formatCurrency(userBalance)} <span className="text-[8px] text-zinc-500">$MON</span></div>
+                          <div className="text-xs font-mono font-bold text-white">{formatAmount(userBalance, 4)} <span className="text-[8px] text-zinc-500">$MON</span></div>
                         </div>
                         <div className="p-3 bg-white/5 rounded-sm border border-white/5">
                           <div className="text-[8px] text-zinc-500 uppercase font-bold mb-1">Margin Locked</div>
