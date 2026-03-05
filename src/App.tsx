@@ -260,20 +260,16 @@ export default function App() {
                   {/* Black background */}
                   <div className="absolute inset-2 rounded-md bg-black/80"></div>
                   
-                  {/* Lightning bolt - Two lines forming lightning */}
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="relative z-10">
-                    {/* Red line - upper left to center */}
-                    <path d="M4 6L12 12" stroke="#FF003C" strokeWidth="2.5" strokeLinecap="round"/>
-                    {/* Green line - center to lower right */}
-                    <path d="M12 12L20 18" stroke="#39FF14" strokeWidth="2.5" strokeLinecap="round"/>
-                    {/* Red line - upper right to center */}
-                    <path d="M20 6L12 12" stroke="#FF003C" strokeWidth="2.5" strokeLinecap="round"/>
-                    {/* Green line - center to lower left */}
-                    <path d="M12 12L4 18" stroke="#39FF14" strokeWidth="2.5" strokeLinecap="round"/>
+                  {/* Lightning bolt - Like reference image */}
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="relative z-10">
+                    {/* Red upper part - zigzag down-left */}
+                    <path d="M18 4L12 10L16 10L10 16" stroke="#FF003C" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" fill="none"/>
+                    {/* Green lower part - zigzag down-right */}
+                    <path d="M10 16L14 16L8 22" stroke="#39FF14" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" fill="none"/>
                   </svg>
                   
-                  {/* Center white glowing dot */}
-                  <div className="absolute w-2 h-2 bg-white rounded-full animate-pulse shadow-[0_0_8px_#ffffff,0_0_16px_#ffffff] z-20"></div>
+                  {/* Center white glowing dot at the angle */}
+                  <div className="absolute w-1.5 h-1.5 bg-white rounded-full animate-pulse shadow-[0_0_6px_#ffffff,0_0_12px_#ffffff] z-20" style={{ top: '58%', left: '42%' }}></div>
                 </div>
                 
                 {/* Italic Styled Text */}
@@ -289,7 +285,7 @@ export default function App() {
             <div className="flex items-center space-x-6 relative">
               {/* Wallet Connected: Show User Stats - Near Wallet */}
               {isWalletConnected && (
-                <div className="hidden lg:flex items-center space-x-6 border-r border-white/10 pr-6 bg-black/50 px-4 py-2 rounded backdrop-blur-sm">
+                <div className="hidden lg:flex items-center space-x-6 border-r border-white/10 pr-6 bg-black/70 px-4 py-2 rounded backdrop-blur-sm">
                   <div className="flex flex-col items-end">
                     <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest font-mono">Balance</span>
                     <span className="text-[14px] font-bold text-white font-mono">{formatCurrency(userBalance)} <span className="font-mono text-[11px]">$MON</span></span>
@@ -474,10 +470,10 @@ export default function App() {
                     ? 'bg-neon-green text-black border-neon-green shadow-[0_0_30px_rgba(57,255,20,0.5)] scale-105'
                     : 'bg-black/60 text-neon-green border-neon-green/40 hover:bg-neon-green/10 hover:shadow-[0_0_20px_rgba(57,255,20,0.2)]'
                   }`}
-                  style={{ fontFamily: "'Bruno Ace SC', sans-serif" }}
+                  style={{ fontFamily: "'Orbitron', sans-serif" }}
                 >
                   <TrendingUp size={20} />
-                  <span>{userPositions.long ? 'CLOSE LONG' : 'LONG $MON'}</span>
+                  <span>{userPositions.long ? 'CLOSE LONG' : 'LONG'}</span>
                 </button>
 
                 <button
@@ -487,10 +483,10 @@ export default function App() {
                     ? 'bg-crimson-red text-white border-crimson-red shadow-[0_0_30px_rgba(255,0,60,0.5)] scale-105'
                     : 'bg-black/60 text-crimson-red border-crimson-red/40 hover:bg-crimson-red/10 hover:shadow-[0_0_20px_rgba(255,0,60,0.2)]'
                   }`}
-                  style={{ fontFamily: "'Bruno Ace SC', sans-serif" }}
+                  style={{ fontFamily: "'Orbitron', sans-serif" }}
                 >
                   <TrendingDown size={20} />
-                  <span>{userPositions.short ? 'CLOSE SHORT' : 'SHORT $MON'}</span>
+                  <span>{userPositions.short ? 'CLOSE SHORT' : 'SHORT'}</span>
                 </button>
               </div>
             </div>
