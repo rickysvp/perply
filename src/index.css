@@ -1,0 +1,143 @@
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=JetBrains+Mono:wght@400;700&family=Michroma&family=Syncopate:wght@400;700&family=Russo+One&family=Exo+2:wght@400;700;900&family=Audiowide&family=Bruno+Ace+SC&family=Wallpoet&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-cyber-black text-white overflow-hidden font-sans;
+}
+
+.cyber-text-gradient {
+  background: linear-gradient(to right, #00F0FF, #BC13FE, #FF003C);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.neon-text-glow {
+  text-shadow: 0 0 5px rgba(0, 240, 255, 0.7), 0 0 10px rgba(0, 240, 255, 0.5), 0 0 20px rgba(0, 240, 255, 0.3);
+}
+
+.neon-text-glow-green {
+  text-shadow: 0 0 5px rgba(57, 255, 20, 0.7), 0 0 10px rgba(57, 255, 20, 0.5), 0 0 20px rgba(57, 255, 20, 0.3);
+}
+
+.neon-text-glow-red {
+  text-shadow: 0 0 5px rgba(255, 0, 60, 0.7), 0 0 10px rgba(255, 0, 60, 0.5), 0 0 20px rgba(255, 0, 60, 0.3);
+}
+
+.neon-text-glow-yellow {
+  text-shadow: 0 0 5px rgba(255, 234, 0, 0.7), 0 0 10px rgba(255, 234, 0, 0.5), 0 0 20px rgba(255, 234, 0, 0.3);
+}
+
+.cyber-border-glow {
+  box-shadow: 0 0 15px rgba(0, 240, 255, 0.2), inset 0 0 15px rgba(0, 240, 255, 0.1);
+}
+
+.scanline-effect {
+  @apply fixed top-0 left-0 w-full h-[2px] z-50 pointer-events-none;
+  background: rgba(57, 255, 20, 0.1);
+  animation: scanline 8s linear infinite;
+}
+
+.grid-bg {
+  background-image: 
+    linear-gradient(rgba(57, 255, 20, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(57, 255, 20, 0.05) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+.faction-glow-green {
+  box-shadow: 0 0 50px -10px rgba(57, 255, 20, 0.4);
+}
+
+.faction-glow-red {
+  box-shadow: 0 0 50px -10px rgba(255, 0, 60, 0.4);
+}
+
+.war-zone-gradient {
+  background: linear-gradient(90deg, rgba(57, 255, 20, 0.1) 0%, rgba(0,0,0,0) 45%, rgba(0,0,0,0) 55%, rgba(255, 0, 60, 0.1) 100%);
+}
+
+.clip-path-hexagon {
+  clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+}
+
+.clip-path-slanted-bottom {
+  clip-path: polygon(0 0, 100% 0, 100% 85%, 95% 100%, 5% 100%, 0 85%);
+}
+
+.clip-path-slanted-header {
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 85% 100%, 83% 45px, 17% 45px, 15% 100%, 0 100%);
+}
+
+.cyber-panel-v2 {
+  background: linear-gradient(90deg, rgba(0, 240, 255, 0.03) 0%, rgba(0, 0, 0, 0.8) 10%, rgba(0, 0, 0, 0.8) 90%, rgba(0, 240, 255, 0.03) 100%);
+  backdrop-filter: blur(16px);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.cyber-rail-l {
+  @apply absolute left-0 top-0 bottom-0 w-[2px];
+  background: linear-gradient(to bottom, transparent, #00F0FF, #00F0FF, transparent);
+  box-shadow: 0 0 15px #00F0FF;
+}
+
+.cyber-rail-r {
+  @apply absolute right-0 top-0 bottom-0 w-[2px];
+  background: linear-gradient(to bottom, transparent, #BC13FE, #BC13FE, transparent);
+  box-shadow: 0 0 15px #BC13FE;
+}
+
+.cyber-rail-green {
+  background: linear-gradient(to bottom, transparent, #39FF14, #39FF14, transparent);
+  box-shadow: 0 0 15px #39FF14;
+}
+
+.cyber-rail-red {
+  background: linear-gradient(to bottom, transparent, #FF003C, #FF003C, transparent);
+  box-shadow: 0 0 15px #FF003C;
+}
+
+.cyber-glass {
+  background: rgba(5, 5, 5, 0.7);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  box-shadow: inset 0 0 20px rgba(0, 240, 255, 0.05);
+}
+
+.cyber-line-v {
+  @apply w-[1px];
+  background: linear-gradient(to bottom, transparent, #00F0FF, transparent);
+}
+
+.cyber-line-h {
+  @apply h-[1px];
+  background: linear-gradient(to right, transparent, #00F0FF, transparent);
+}
+
+.cyber-corner-tl {
+  @apply absolute top-0 left-0 w-[10px] h-[10px];
+  border-top: 2px solid #00F0FF;
+  border-left: 2px solid #00F0FF;
+}
+
+.cyber-corner-br {
+  @apply absolute bottom-0 right-0 w-[10px] h-[10px];
+  border-bottom: 2px solid #BC13FE;
+  border-right: 2px solid #BC13FE;
+}
+
+.hud-line {
+  @apply h-[1px] w-full;
+  background: linear-gradient(90deg, transparent, #00F0FF, transparent);
+  opacity: 0.3;
+}
+
+.data-stream-bg {
+  background: linear-gradient(to bottom, transparent, rgba(0, 240, 255, 0.05), transparent);
+  background-size: 100% 200%;
+  animation: dataStream 10s linear infinite;
+}
