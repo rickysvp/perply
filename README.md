@@ -16,7 +16,7 @@ Web3 long/short arena on Monad testnet.
 - Chain Name: `Monad Testnet`
 - Chain ID: `10143`
 - RPC URL: `https://testnet-rpc.monad.xyz`
-- Explorer: `https://testnet.monadexplorer.com`
+- Explorer: `https://testnet.monadvision.com`
 
 ## Prerequisites
 
@@ -56,6 +56,22 @@ export MONAD_RPC_URL=https://testnet-rpc.monad.xyz
 npm run contract:set-risk:monad
 ```
 
+`setRiskParams` now queues config updates behind a timelock.  
+Run execution after `queuedRiskParamsEta` is reached:
+
+```bash
+export EXECUTE_NOW=true
+npm run contract:set-risk:monad
+```
+
+If a queue is already pending, the script now aborts by default.  
+Set `CANCEL_EXISTING_QUEUE=true` to cancel and re-queue:
+
+```bash
+export CANCEL_EXISTING_QUEUE=true
+npm run contract:set-risk:monad
+```
+
 Smoke check live fee params:
 
 ```bash
@@ -70,14 +86,69 @@ Create `.env.local`:
 
 ```bash
 VITE_PERPLY_ARENA_ADDRESS=0xYourDeployedContractAddress
-VITE_PYTH_BTC_PRICE_ID=0xe62df6c8b4a85fe1fef3f1a6d5af3f4820553a4f8f8036f2fa14de3cd59adf04
+VITE_PYTH_BTC_PRICE_ID=0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43
 VITE_CHAINLINK_BTC_USD_FEED=0x... # optional
+VITE_CHAINLINK_MAX_STALENESS_SEC=90
+VITE_MONAD_RPC_URLS=https://testnet-rpc.monad.xyz,https://another-rpc.example
 ```
+
+Security note: RPC URLs must use `https://` in production. `http://` is only accepted for `localhost`/`127.0.0.1` during local debugging.
 
 ## Run Frontend
 
 ```bash
 npm run dev
+```
+
+## RPC Health Probe
+
+- Server endpoint: `GET /api/rpc/health`
+- Example response includes per-RPC latency and latest block probe.
+- Market proxy endpoint: `GET /api/market/coingecko` (same-origin proxy + cache to avoid browser CORS/rate-limit noise)
+
+## Off-Chain Keeper Signer
+
+Run settlement keeper outside browser:
+
+```bash
+export PERPLY_ARENA_ADDRESS=0xYourDeployedContractAddress
+export KEEPER_PRIVATE_KEY=0xyour_keeper_pk
+export PRICE_SIGNER_PRIVATE_KEY=0xyour_price_signer_pk
+export VITE_MONAD_RPC_URLS=https://testnet-rpc.monad.xyz,https://another-rpc.example
+export KEEPER_POLL_MS=2000
+export KEEPER_MIN_PRICE_SOURCES=2
+export KEEPER_MAX_DEVIATION_PCT=10
+export KEEPER_CHAIN_ID=10143
+export KEEPER_DRY_RUN=false
+npm run keeper:run
+```
+
+Security note: `KEEPER_PRIVATE_KEY` and `PRICE_SIGNER_PRIVATE_KEY` must be different keys.
+
+Run full security preflight before release:
+
+```bash
+npm run preflight:security
+```
+
+Release checklist:
+
+- `PRELAUNCH_CHECKLIST.md`
+
+Emergency controls drill (plan-only by default):
+
+```bash
+npm run drill:emergency
+```
+
+Execute real drill on-chain and auto-rollback to snapshot state:
+
+```bash
+export DEPLOYER_PRIVATE_KEY=0xyour_private_key
+export PERPLY_ARENA_ADDRESS=0xYourDeployedContractAddress
+export EXECUTE=true
+export DRILL_CONFIRM=YES
+npm run drill:emergency
 ```
 
 ## V1.1 Rules Implemented
@@ -87,10 +158,18 @@ npm run dev
 3. Settlement fee `0.01%` per tick
 4. Dynamic congestion surcharge on crowded side
 5. Congestion surcharge split: `80%` to opposite camp, `20%` to treasury
-6. Tick settlement: `10s` interval + early trigger when volatility threshold reached
+6. Tick settlement: `3s` interval + early trigger when volatility threshold reached
 7. Liquidation mechanism with maintenance margin and liquidation penalty
 8. Frontend fee preview before placing bet (includes congestion surcharge and opponent reward)
 9. Fee treasury reserved for future liquidity-pool subsidy programs
+
+## Security Model (V1.2)
+
+1. Direct `settleWithPrice` is disabled by default.
+2. Production keeper should call `settleWithSignedPrice` with an off-chain signer.
+3. `setRiskParams` is timelocked; execute with `executeRiskParams()` after delay.
+4. `paused` and `reduceOnly` switches are available for incident response.
+5. Uncovered loss is tracked as `systemBadDebt`; new opens are blocked until debt is recapitalized.
 
 ## V1.1 Source Aggregation
 

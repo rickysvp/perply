@@ -10,8 +10,11 @@ export const MONAD_TESTNET = {
     decimals: 18
   },
   rpcUrls: ['https://testnet-rpc.monad.xyz'],
-  blockExplorerUrls: ['https://testnet.monadexplorer.com']
+  blockExplorerUrls: ['https://testnet.monadvision.com']
 } as const;
+
+const DEFAULT_RPC_TIMEOUT_MS = 1800;
+let cachedHealthyRpcUrl: string | null = null;
 
 export const PERPLY_ARENA_ABI = [
   'function owner() view returns (address)',
@@ -66,6 +69,117 @@ export interface ArenaPositionRaw {
   pnl: bigint;
   equity: bigint;
   maintenanceMargin: bigint;
+}
+
+export interface RpcHealthProbe {
+  url: string;
+  ok: boolean;
+  latencyMs: number;
+  blockNumber?: number;
+  error?: string;
+}
+
+function parseRpcUrls(raw: string | undefined | null): string[] {
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map(item => item.trim())
+    .filter(item => item.length > 0);
+}
+
+function isAllowedRpcUrl(urlRaw: string): boolean {
+  try {
+    const parsed = new URL(urlRaw);
+    if (parsed.protocol === 'https:') return true;
+    if (parsed.protocol !== 'http:') return false;
+    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+  } catch {
+    return false;
+  }
+}
+
+function uniqueUrls(urls: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const url of urls) {
+    if (seen.has(url)) continue;
+    seen.add(url);
+    result.push(url);
+  }
+  return result;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = globalThis.setTimeout(() => reject(new Error(reason)), timeoutMs);
+    promise
+      .then(value => {
+        globalThis.clearTimeout(timer);
+        resolve(value);
+      })
+      .catch(error => {
+        globalThis.clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
+
+export function getMonadRpcUrls(): string[] {
+  const customList = parseRpcUrls(import.meta.env.VITE_MONAD_RPC_URLS).filter(isAllowedRpcUrl);
+  const single = parseRpcUrls(import.meta.env.VITE_MONAD_RPC_URL).filter(isAllowedRpcUrl);
+  return uniqueUrls([...customList, ...single, ...MONAD_TESTNET.rpcUrls]);
+}
+
+export async function probeMonadRpcUrls(timeoutMs = DEFAULT_RPC_TIMEOUT_MS): Promise<RpcHealthProbe[]> {
+  const urls = getMonadRpcUrls();
+  const probes = await Promise.all(urls.map(async (url): Promise<RpcHealthProbe> => {
+    const provider = new ethers.JsonRpcProvider(url);
+    const start = Date.now();
+    try {
+      const blockNumber = await withTimeout(
+        provider.getBlockNumber(),
+        timeoutMs,
+        `RPC timeout: ${url}`
+      );
+      const latencyMs = Date.now() - start;
+      return {
+        url,
+        ok: true,
+        latencyMs: Math.round(latencyMs),
+        blockNumber
+      };
+    } catch (error) {
+      const latencyMs = Date.now() - start;
+      const message = error instanceof Error ? error.message : 'unknown error';
+      return {
+        url,
+        ok: false,
+        latencyMs: Math.round(latencyMs),
+        error: message
+      };
+    }
+  }));
+  return probes;
+}
+
+export async function getRpcProviderWithFallback(timeoutMs = DEFAULT_RPC_TIMEOUT_MS): Promise<ethers.JsonRpcProvider> {
+  const urls = getMonadRpcUrls();
+  const ordered = cachedHealthyRpcUrl
+    ? [cachedHealthyRpcUrl, ...urls.filter(url => url !== cachedHealthyRpcUrl)]
+    : urls;
+
+  for (const url of ordered) {
+    const provider = new ethers.JsonRpcProvider(url);
+    try {
+      await withTimeout(provider.getBlockNumber(), timeoutMs, `RPC timeout: ${url}`);
+      cachedHealthyRpcUrl = url;
+      return provider;
+    } catch {
+      // try next rpc endpoint
+    }
+  }
+
+  throw new Error(`No healthy Monad RPC endpoint from: ${ordered.join(', ')}`);
 }
 
 export function getEthereumProvider(): WalletProvider | null {
@@ -230,6 +344,6 @@ export async function ensureMonadTestnet(provider: WalletProvider): Promise<void
 export async function getReadonlyArenaContract() {
   const address = getArenaAddress();
   if (!address) return null;
-  const provider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
+  const provider = await getRpcProviderWithFallback();
   return new ethers.Contract(address, PERPLY_ARENA_ABI, provider);
 }

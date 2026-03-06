@@ -12,7 +12,10 @@
     "contract:build": "forge build",
     "contract:deploy:monad": "bash scripts/deploy-monad.sh",
     "contract:set-risk:monad": "bash scripts/set-risk-params-monad.sh",
-    "contract:smoke-fees:monad": "bash scripts/smoke-check-fees-monad.sh"
+    "contract:smoke-fees:monad": "bash scripts/smoke-check-fees-monad.sh",
+    "preflight:security": "bash scripts/preflight-security.sh",
+    "drill:emergency": "bash scripts/drill-emergency-controls.sh",
+    "keeper:run": "tsx scripts/keeper-signer.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

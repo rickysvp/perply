@@ -10,14 +10,22 @@ contract PerplyArenaTest is Test {
     uint8 internal constant SHORT = 1;
     uint16 internal constant BPS = 10_000;
 
+    uint256 internal signerPk = 0xA11CE;
+    uint64 internal priceSalt;
+
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
     address internal carol = makeAddr("carol");
+    address internal signer;
 
     PerplyArena internal arena;
 
     function setUp() public {
         arena = new PerplyArena(100e8);
+        signer = vm.addr(signerPk);
+        arena.setPriceSigner(signer);
+        vm.warp(block.timestamp + arena.adminOpsTimelockSec());
+        arena.executePriceSignerUpdate();
         vm.deal(alice, 100 ether);
         vm.deal(bob, 100 ether);
         vm.deal(carol, 100 ether);
@@ -88,7 +96,7 @@ contract PerplyArenaTest is Test {
         );
 
         PerplyArena.PositionView memory bobShort = arena.getPosition(bob, SHORT);
-        assertEq(bobShort.pnl, int256(congestionToOpposite), "opposite side should receive congestion rewards");
+        assertEq(bobShort.pnl, _toInt256Safe(congestionToOpposite), "opposite side should receive congestion rewards");
     }
 
     function testSettlementFeeGoesToTreasuryAndUpdatesCampPnL() public {
@@ -106,7 +114,7 @@ contract PerplyArenaTest is Test {
         uint256 expectedWinnerNet = 0.079992 ether;
 
         uint256 treasuryBefore = arena.treasuryBalance();
-        arena.settleWithPrice(newPrice);
+        _settleSigned(newPrice);
         uint256 treasuryAfter = arena.treasuryBalance();
 
         assertEq(
@@ -118,8 +126,8 @@ contract PerplyArenaTest is Test {
         PerplyArena.PositionView memory longPos = arena.getPosition(alice, LONG);
         PerplyArena.PositionView memory shortPos = arena.getPosition(bob, SHORT);
 
-        assertEq(longPos.pnl, int256(expectedWinnerNet), "long side pnl mismatch");
-        assertEq(shortPos.pnl, -int256(expectedGross), "short side pnl mismatch");
+        assertEq(longPos.pnl, _toInt256Safe(expectedWinnerNet), "long side pnl mismatch");
+        assertEq(shortPos.pnl, -_toInt256Safe(expectedGross), "short side pnl mismatch");
     }
 
     function testCloseFeeIsHalfPercentOfPositiveEquity() public {
@@ -130,7 +138,7 @@ contract PerplyArenaTest is Test {
         _open(bob, SHORT, 1 ether, 10);
 
         vm.warp(block.timestamp + arena.minSettlementInterval());
-        arena.settleWithPrice(101e8);
+        _settleSigned(101e8);
 
         PerplyArena.PositionView memory longPos = arena.getPosition(alice, LONG);
         assertTrue(longPos.isOpen, "long must be open before close");
@@ -151,6 +159,308 @@ contract PerplyArenaTest is Test {
         assertFalse(closed.isOpen, "position should be closed");
     }
 
+    function testDirectSettlementDisabledByDefault() public {
+        vm.expectRevert(PerplyArena.DirectSettlementDisabled.selector);
+        arena.settleWithPrice(101e8);
+    }
+
+    function testSignedSettlementRejectsReplay() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 10);
+        _deposit(bob, 10 ether);
+        _open(bob, SHORT, 1 ether, 10);
+
+        vm.warp(block.timestamp + arena.minSettlementInterval());
+        uint64 timestamp = uint64(block.timestamp);
+        uint64 salt = ++priceSalt;
+        bytes memory sig = _signPrice(101e8, timestamp, salt);
+
+        arena.settleWithSignedPrice(101e8, timestamp, salt, sig);
+        vm.expectRevert(PerplyArena.SignatureAlreadyUsed.selector);
+        arena.settleWithSignedPrice(101e8, timestamp, salt, sig);
+    }
+
+    function testSignedSettlementRequiresOwnerOrKeeperCaller() public {
+        uint64 timestamp = uint64(block.timestamp);
+        uint64 salt = ++priceSalt;
+        bytes memory sig = _signPrice(101e8, timestamp, salt);
+
+        vm.prank(alice);
+        vm.expectRevert(PerplyArena.UnauthorizedKeeper.selector);
+        arena.settleWithSignedPrice(101e8, timestamp, salt, sig);
+    }
+
+    function testSignedSettlementRejectsPriceOutOfRange() public {
+        uint256 tooLargePrice = uint256(type(uint64).max) + 1;
+        uint64 timestamp = uint64(block.timestamp);
+        uint64 salt = ++priceSalt;
+        bytes memory sig = _signPrice(tooLargePrice, timestamp, salt);
+        vm.expectRevert(PerplyArena.PriceOutOfRange.selector);
+        arena.settleWithSignedPrice(tooLargePrice, timestamp, salt, sig);
+    }
+
+    function testSignedSettlementRejectsStalePrice() public {
+        vm.warp(block.timestamp + uint256(arena.maxPriceAgeSec()) + 2);
+        uint64 staleTimestamp = uint64(block.timestamp - uint256(arena.maxPriceAgeSec()) - 1);
+        bytes memory sig = _signPrice(101e8, staleTimestamp, ++priceSalt);
+        vm.expectRevert(PerplyArena.StalePrice.selector);
+        arena.settleWithSignedPrice(101e8, staleTimestamp, priceSalt, sig);
+    }
+
+    function testSignedSettlementRejectsNonIncreasingTimestamp() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 10);
+        _deposit(bob, 10 ether);
+        _open(bob, SHORT, 1 ether, 10);
+
+        vm.warp(block.timestamp + arena.minSettlementInterval());
+        uint64 timestamp = uint64(block.timestamp);
+
+        bytes memory sig1 = _signPrice(101e8, timestamp, ++priceSalt);
+        arena.settleWithSignedPrice(101e8, timestamp, priceSalt, sig1);
+
+        bytes memory sig2 = _signPrice(102e8, timestamp, ++priceSalt);
+        vm.expectRevert(PerplyArena.StalePrice.selector);
+        arena.settleWithSignedPrice(102e8, timestamp, priceSalt, sig2);
+    }
+
+    function testPauseBlocksDepositButAllowsRiskReduction() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 10);
+
+        arena.setPaused(true);
+
+        vm.prank(bob);
+        vm.expectRevert(PerplyArena.Paused.selector);
+        arena.deposit{value: 1 ether}();
+
+        _close(alice, LONG);
+        assertFalse(arena.getPosition(alice, LONG).isOpen, "close should still work in paused mode");
+    }
+
+    function testReduceOnlyBlocksOpenButAllowsClose() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 10);
+
+        _deposit(bob, 10 ether);
+        arena.setReduceOnly(true);
+
+        vm.prank(bob);
+        vm.expectRevert(PerplyArena.ReduceOnly.selector);
+        arena.openPosition(SHORT, 1 ether, 10);
+
+        _close(alice, LONG);
+        assertFalse(arena.getPosition(alice, LONG).isOpen, "close should still work in reduce-only mode");
+    }
+
+    function testRiskParamsTimelockQueueAndExecute() public {
+        arena.setRiskParams(
+            20,
+            20,
+            7000,
+            2500,
+            40,
+            40,
+            1,
+            1000,
+            5000,
+            60,
+            700,
+            35,
+            250,
+            5000
+        );
+
+        assertTrue(arena.hasQueuedRiskParams(), "queue must be active");
+        vm.expectRevert(PerplyArena.RiskParamsTimelockPending.selector);
+        arena.executeRiskParams();
+
+        vm.warp(block.timestamp + arena.riskParamsTimelockSec());
+        arena.executeRiskParams();
+
+        assertEq(arena.minSettlementInterval(), 20, "min settlement interval mismatch");
+        assertEq(arena.openFeeBps(), 40, "open fee mismatch");
+        assertEq(arena.closeFeeBps(), 40, "close fee mismatch");
+        assertEq(arena.maxCongestionFeeBps(), 60, "congestion cap mismatch");
+    }
+
+    function testRiskParamsBoundsEnforced() public {
+        vm.expectRevert(PerplyArena.InvalidAmount.selector);
+        arena.setRiskParams(
+            10,
+            15,
+            8000,
+            3000,
+            501, // > 5%
+            50,
+            1,
+            1000,
+            5000,
+            50,
+            600,
+            40,
+            200,
+            5000
+        );
+    }
+
+    function testRiskParamsCannotOverwritePendingQueue() public {
+        arena.setRiskParams(
+            20,
+            20,
+            7000,
+            2500,
+            40,
+            40,
+            1,
+            1000,
+            5000,
+            60,
+            700,
+            35,
+            250,
+            5000
+        );
+
+        vm.expectRevert(PerplyArena.RiskParamsAlreadyQueued.selector);
+        arena.setRiskParams(
+            30,
+            20,
+            7000,
+            2500,
+            45,
+            45,
+            1,
+            1200,
+            5500,
+            70,
+            750,
+            40,
+            260,
+            5500
+        );
+    }
+
+    function testKeeperUpdateIsTimelocked() public {
+        address newKeeper = makeAddr("newKeeper");
+        arena.setKeeper(newKeeper);
+
+        vm.expectRevert(PerplyArena.AdminOperationTimelockPending.selector);
+        arena.executeKeeperUpdate();
+
+        vm.warp(block.timestamp + arena.adminOpsTimelockSec());
+        arena.executeKeeperUpdate();
+        assertEq(arena.keeper(), newKeeper, "keeper update should execute after timelock");
+    }
+
+    function testKeeperUpdateCannotOverwritePendingQueue() public {
+        arena.setKeeper(makeAddr("keeperOne"));
+        vm.expectRevert(PerplyArena.AdminOperationAlreadyQueued.selector);
+        arena.setKeeper(makeAddr("keeperTwo"));
+    }
+
+    function testPriceSignerUpdateCannotOverwritePendingQueue() public {
+        arena.setPriceSigner(makeAddr("signerOne"));
+        vm.expectRevert(PerplyArena.AdminOperationAlreadyQueued.selector);
+        arena.setPriceSigner(makeAddr("signerTwo"));
+    }
+
+    function testDirectSettlementToggleIsTimelocked() public {
+        arena.setDirectSettlementEnabled(true);
+        vm.expectRevert(PerplyArena.AdminOperationTimelockPending.selector);
+        arena.executeDirectSettlementToggle();
+
+        vm.warp(block.timestamp + arena.adminOpsTimelockSec());
+        arena.executeDirectSettlementToggle();
+        assertTrue(arena.directSettlementEnabled(), "direct settlement must be enabled after timelock");
+    }
+
+    function testDirectSettlementToggleCannotOverwritePendingQueue() public {
+        arena.setDirectSettlementEnabled(true);
+        vm.expectRevert(PerplyArena.AdminOperationAlreadyQueued.selector);
+        arena.setDirectSettlementEnabled(false);
+    }
+
+    function testTreasuryWithdrawalIsTimelocked() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 10);
+
+        uint256 amount = 0.001 ether;
+        uint256 before = alice.balance;
+        arena.withdrawTreasury(payable(alice), amount);
+
+        vm.expectRevert(PerplyArena.AdminOperationTimelockPending.selector);
+        arena.executeTreasuryWithdrawal();
+
+        vm.warp(block.timestamp + arena.adminOpsTimelockSec());
+        arena.executeTreasuryWithdrawal();
+        assertEq(alice.balance, before + amount, "treasury withdrawal should execute after timelock");
+    }
+
+    function testTreasuryWithdrawalCannotOverwritePendingQueue() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 10);
+
+        arena.withdrawTreasury(payable(alice), 0.001 ether);
+        vm.expectRevert(PerplyArena.AdminOperationAlreadyQueued.selector);
+        arena.withdrawTreasury(payable(bob), 0.001 ether);
+    }
+
+    function testInsuranceWithdrawalIsTimelocked() public {
+        vm.prank(alice);
+        arena.donateInsurance{value: 1 ether}();
+
+        uint256 amount = 0.2 ether;
+        uint256 before = alice.balance;
+        arena.withdrawInsurance(payable(alice), amount);
+
+        vm.expectRevert(PerplyArena.AdminOperationTimelockPending.selector);
+        arena.executeInsuranceWithdrawal();
+
+        vm.warp(block.timestamp + arena.adminOpsTimelockSec());
+        arena.executeInsuranceWithdrawal();
+        assertEq(alice.balance, before + amount, "insurance withdrawal should execute after timelock");
+    }
+
+    function testInsuranceWithdrawalCannotOverwritePendingQueue() public {
+        vm.prank(alice);
+        arena.donateInsurance{value: 1 ether}();
+
+        arena.withdrawInsurance(payable(alice), 0.2 ether);
+        vm.expectRevert(PerplyArena.AdminOperationAlreadyQueued.selector);
+        arena.withdrawInsurance(payable(bob), 0.1 ether);
+    }
+
+    function testBadDebtIsTrackedAndBlocksNewOpenUntilRecapitalized() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 100);
+        _deposit(bob, 10 ether);
+        _open(bob, SHORT, 1 ether, 100);
+
+        _advanceAndSettle(101e8);
+        _advanceAndSettle(102e8);
+        _advanceAndSettle(103e8);
+        _advanceAndSettle(104e8);
+
+        _close(bob, SHORT);
+        assertGt(arena.systemBadDebt(), 0, "system bad debt must be recorded");
+        vm.expectRevert(PerplyArena.SystemInsolvent.selector);
+        arena.withdrawTreasury(payable(address(this)), 1);
+
+        _deposit(carol, 10 ether);
+        vm.prank(carol);
+        vm.expectRevert(PerplyArena.SystemInsolvent.selector);
+        arena.openPosition(LONG, 1 ether, 5);
+
+        vm.prank(alice);
+        arena.donateInsurance{value: arena.systemBadDebt()}();
+        assertEq(arena.systemBadDebt(), 0, "bad debt should be repaid");
+
+        vm.prank(carol);
+        arena.openPosition(LONG, 1 ether, 5);
+        assertTrue(arena.getPosition(carol, LONG).isOpen, "open should resume after recapitalization");
+    }
+
     function _deposit(address trader, uint256 amount) internal {
         vm.prank(trader);
         arena.deposit{value: amount}();
@@ -164,5 +474,30 @@ contract PerplyArenaTest is Test {
     function _close(address trader, uint8 side) internal {
         vm.prank(trader);
         arena.closePosition(side);
+    }
+
+    function _settleSigned(uint256 newPrice) internal {
+        uint64 timestamp = uint64(block.timestamp);
+        uint64 salt = ++priceSalt;
+        bytes memory sig = _signPrice(newPrice, timestamp, salt);
+        arena.settleWithSignedPrice(newPrice, timestamp, salt, sig);
+    }
+
+    function _advanceAndSettle(uint256 newPrice) internal {
+        vm.warp(block.timestamp + arena.minSettlementInterval());
+        _settleSigned(newPrice);
+    }
+
+    function _signPrice(uint256 newPrice, uint64 timestamp, uint64 salt) internal view returns (bytes memory) {
+        bytes32 digest = keccak256(abi.encodePacked(address(arena), block.chainid, newPrice, timestamp, salt));
+        bytes32 ethDigest = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", digest));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, ethDigest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _toInt256Safe(uint256 value) internal pure returns (int256) {
+        if (value > uint256(type(int256).max)) revert("int256 overflow in test");
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return int256(value);
     }
 }

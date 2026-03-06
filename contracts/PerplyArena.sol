@@ -6,6 +6,8 @@ contract PerplyArena {
     uint8 public constant SIDE_SHORT = 1;
     uint16 public constant BPS = 10_000;
     int256 private constant PRECISION = 1e18;
+    uint256 private constant SECP256K1N_HALF =
+        0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
 
     struct Position {
         uint256 margin;
@@ -27,11 +29,57 @@ contract PerplyArena {
         uint256 maintenanceMargin;
     }
 
+    struct QueuedRiskParams {
+        uint32 minSettlementInterval;
+        uint16 volatilityTriggerBps;
+        uint16 settlementStrengthBps;
+        uint16 maxSettlementTransferBps;
+        uint16 openFeeBps;
+        uint16 closeFeeBps;
+        uint16 settlementFeeBps;
+        uint16 congestionStartBps;
+        uint16 congestionFullBps;
+        uint16 maxCongestionFeeBps;
+        uint16 maintenanceBaseBps;
+        uint16 maintenanceLeverageBps;
+        uint16 liquidationPenaltyBps;
+        uint16 liquidatorRewardShareBps;
+    }
+
+    struct TimelockedAddressOperation {
+        address value;
+        uint256 eta;
+        bool queued;
+    }
+
+    struct TimelockedBoolOperation {
+        bool value;
+        uint256 eta;
+        bool queued;
+    }
+
+    struct TimelockedWithdrawalOperation {
+        address payable to;
+        uint256 amount;
+        uint256 eta;
+        bool queued;
+    }
+
     address public owner;
     address public keeper;
+    address public priceSigner;
 
     uint256 public markPriceE8;
     uint256 public lastSettlementAt;
+    uint256 public queuedRiskParamsEta;
+
+    uint32 public riskParamsTimelockSec;
+    uint32 public adminOpsTimelockSec;
+    uint32 public maxPriceAgeSec;
+    bool public hasQueuedRiskParams;
+    bool public paused;
+    bool public reduceOnly;
+    bool public directSettlementEnabled;
 
     uint32 public minSettlementInterval;
     uint16 public volatilityTriggerBps;
@@ -53,20 +101,29 @@ contract PerplyArena {
 
     uint256 public treasuryBalance;
     uint256 public insuranceFund;
+    uint256 public systemBadDebt;
 
     mapping(address => uint256) public availableBalance;
     mapping(address => mapping(uint8 => Position)) private positions;
+    mapping(bytes32 => bool) public usedPriceDigests;
 
     uint256[2] public sideWeight;
     uint256[2] public sideMargin;
     int256[2] public accPnlPerWeight;
     uint256[2] public cumulativeCongestionRewards;
+    QueuedRiskParams private queuedRiskParams;
+    TimelockedAddressOperation private queuedKeeperUpdate;
+    TimelockedAddressOperation private queuedPriceSignerUpdate;
+    TimelockedBoolOperation private queuedDirectSettlementToggle;
+    TimelockedWithdrawalOperation private queuedTreasuryWithdrawal;
+    TimelockedWithdrawalOperation private queuedInsuranceWithdrawal;
 
     error OnlyOwner();
     error UnauthorizedKeeper();
     error InvalidSide();
     error InvalidAmount();
     error InvalidPrice();
+    error PriceOutOfRange();
     error InvalidLeverage();
     error PositionExists();
     error PositionMissing();
@@ -74,11 +131,44 @@ contract PerplyArena {
     error SettlementTooEarly();
     error NotLiquidatable();
     error TransferFailed();
+    error Paused();
+    error ReduceOnly();
+    error DirectSettlementDisabled();
+    error InvalidSignature();
+    error SignatureAlreadyUsed();
+    error StalePrice();
+    error NoRiskParamsQueued();
+    error RiskParamsAlreadyQueued();
+    error RiskParamsTimelockPending();
+    error NoAdminOperationQueued();
+    error AdminOperationAlreadyQueued();
+    error AdminOperationTimelockPending();
+    error InvalidAddress();
+    error SystemInsolvent();
 
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
     event KeeperUpdated(address indexed newKeeper);
+    event PriceSignerUpdated(address indexed oldSigner, address indexed newSigner);
+    event PriceAgeUpdated(uint32 maxPriceAgeSec);
     event MarkPriceUpdated(uint256 oldPriceE8, uint256 newPriceE8);
     event ParamsUpdated();
+    event RiskParamsQueued(bytes32 indexed paramsHash, uint256 executeAfter);
+    event RiskParamsQueueCancelled(bytes32 indexed paramsHash);
+    event RiskParamsTimelockUpdated(uint32 newDelaySec);
+    event AdminOpsTimelockUpdated(uint32 newDelaySec);
+    event PauseUpdated(bool paused);
+    event ReduceOnlyUpdated(bool reduceOnly);
+    event DirectSettlementToggled(bool enabled);
+    event KeeperUpdateQueued(address indexed newKeeper, uint256 executeAfter);
+    event KeeperUpdateCancelled(address indexed queuedKeeper);
+    event PriceSignerUpdateQueued(address indexed newSigner, uint256 executeAfter);
+    event PriceSignerUpdateCancelled(address indexed queuedSigner);
+    event DirectSettlementToggleQueued(bool enabled, uint256 executeAfter);
+    event DirectSettlementToggleCancelled(bool enabled);
+    event TreasuryWithdrawalQueued(address indexed to, uint256 amount, uint256 executeAfter);
+    event TreasuryWithdrawalCancelled(address indexed to, uint256 amount);
+    event InsuranceWithdrawalQueued(address indexed to, uint256 amount, uint256 executeAfter);
+    event InsuranceWithdrawalCancelled(address indexed to, uint256 amount);
 
     event Deposited(address indexed trader, uint256 amount, uint256 newAvailableBalance);
     event Withdrawn(address indexed trader, uint256 amount, uint256 newAvailableBalance);
@@ -133,22 +223,40 @@ contract PerplyArena {
 
     event TreasuryWithdrawn(address indexed to, uint256 amount);
     event InsuranceWithdrawn(address indexed to, uint256 amount);
+    event InsuranceFunded(address indexed sender, uint256 amount, uint256 remainingBadDebt);
+    event BadDebtRecorded(uint256 uncoveredDebt, uint256 totalBadDebt);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
         _;
     }
 
+    modifier whenNotPaused() {
+        if (paused) revert Paused();
+        _;
+    }
+
+    modifier whenNotReduceOnly() {
+        if (reduceOnly) revert ReduceOnly();
+        _;
+    }
+
     constructor(uint256 initialPriceE8) {
         if (initialPriceE8 == 0) revert InvalidPrice();
+        if (initialPriceE8 > type(uint64).max) revert PriceOutOfRange();
 
         owner = msg.sender;
         keeper = msg.sender;
+        priceSigner = msg.sender;
 
         markPriceE8 = initialPriceE8;
         lastSettlementAt = block.timestamp;
+        maxPriceAgeSec = 90;
+        riskParamsTimelockSec = 6 hours;
+        adminOpsTimelockSec = 6 hours;
+        directSettlementEnabled = false;
 
-        minSettlementInterval = 10;
+        minSettlementInterval = 3;
         volatilityTriggerBps = 15; // 0.15%
         settlementStrengthBps = 8000; // k = 0.8
         maxSettlementTransferBps = 3000; // max 30% of losing side margin per tick
@@ -172,15 +280,117 @@ contract PerplyArena {
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
-        if (newOwner == address(0)) revert InvalidAmount();
+        if (newOwner == address(0)) revert InvalidAddress();
         address oldOwner = owner;
         owner = newOwner;
         emit OwnershipTransferred(oldOwner, newOwner);
     }
 
     function setKeeper(address newKeeper) external onlyOwner {
-        keeper = newKeeper;
-        emit KeeperUpdated(newKeeper);
+        if (newKeeper == address(0)) revert InvalidAddress();
+        if (queuedKeeperUpdate.queued) revert AdminOperationAlreadyQueued();
+        queuedKeeperUpdate = TimelockedAddressOperation({
+            value: newKeeper,
+            eta: block.timestamp + adminOpsTimelockSec,
+            queued: true
+        });
+        emit KeeperUpdateQueued(newKeeper, queuedKeeperUpdate.eta);
+    }
+
+    function executeKeeperUpdate() external onlyOwner {
+        if (!queuedKeeperUpdate.queued) revert NoAdminOperationQueued();
+        if (block.timestamp < queuedKeeperUpdate.eta) revert AdminOperationTimelockPending();
+        keeper = queuedKeeperUpdate.value;
+        delete queuedKeeperUpdate;
+        emit KeeperUpdated(keeper);
+    }
+
+    function cancelKeeperUpdate() external onlyOwner {
+        if (!queuedKeeperUpdate.queued) revert NoAdminOperationQueued();
+        address queued = queuedKeeperUpdate.value;
+        delete queuedKeeperUpdate;
+        emit KeeperUpdateCancelled(queued);
+    }
+
+    function setPriceSigner(address newSigner) external onlyOwner {
+        if (newSigner == address(0)) revert InvalidAddress();
+        if (queuedPriceSignerUpdate.queued) revert AdminOperationAlreadyQueued();
+        queuedPriceSignerUpdate = TimelockedAddressOperation({
+            value: newSigner,
+            eta: block.timestamp + adminOpsTimelockSec,
+            queued: true
+        });
+        emit PriceSignerUpdateQueued(newSigner, queuedPriceSignerUpdate.eta);
+    }
+
+    function executePriceSignerUpdate() external onlyOwner {
+        if (!queuedPriceSignerUpdate.queued) revert NoAdminOperationQueued();
+        if (block.timestamp < queuedPriceSignerUpdate.eta) revert AdminOperationTimelockPending();
+        address oldSigner = priceSigner;
+        priceSigner = queuedPriceSignerUpdate.value;
+        delete queuedPriceSignerUpdate;
+        emit PriceSignerUpdated(oldSigner, priceSigner);
+    }
+
+    function cancelPriceSignerUpdate() external onlyOwner {
+        if (!queuedPriceSignerUpdate.queued) revert NoAdminOperationQueued();
+        address queued = queuedPriceSignerUpdate.value;
+        delete queuedPriceSignerUpdate;
+        emit PriceSignerUpdateCancelled(queued);
+    }
+
+    function setMaxPriceAgeSec(uint32 newMaxPriceAgeSec) external onlyOwner {
+        if (newMaxPriceAgeSec == 0 || newMaxPriceAgeSec > 900) revert InvalidAmount();
+        maxPriceAgeSec = newMaxPriceAgeSec;
+        emit PriceAgeUpdated(newMaxPriceAgeSec);
+    }
+
+    function setRiskParamsTimelockSec(uint32 newDelaySec) external onlyOwner {
+        if (newDelaySec < 1 hours || newDelaySec > 7 days) revert InvalidAmount();
+        riskParamsTimelockSec = newDelaySec;
+        emit RiskParamsTimelockUpdated(newDelaySec);
+    }
+
+    function setAdminOpsTimelockSec(uint32 newDelaySec) external onlyOwner {
+        if (newDelaySec < 1 hours || newDelaySec > 7 days) revert InvalidAmount();
+        adminOpsTimelockSec = newDelaySec;
+        emit AdminOpsTimelockUpdated(newDelaySec);
+    }
+
+    function setPaused(bool newPaused) external onlyOwner {
+        paused = newPaused;
+        emit PauseUpdated(newPaused);
+    }
+
+    function setReduceOnly(bool newReduceOnly) external onlyOwner {
+        reduceOnly = newReduceOnly;
+        emit ReduceOnlyUpdated(newReduceOnly);
+    }
+
+    function setDirectSettlementEnabled(bool enabled) external onlyOwner {
+        if (queuedDirectSettlementToggle.queued) revert AdminOperationAlreadyQueued();
+        queuedDirectSettlementToggle = TimelockedBoolOperation({
+            value: enabled,
+            eta: block.timestamp + adminOpsTimelockSec,
+            queued: true
+        });
+        emit DirectSettlementToggleQueued(enabled, queuedDirectSettlementToggle.eta);
+    }
+
+    function executeDirectSettlementToggle() external onlyOwner {
+        if (!queuedDirectSettlementToggle.queued) revert NoAdminOperationQueued();
+        if (block.timestamp < queuedDirectSettlementToggle.eta) revert AdminOperationTimelockPending();
+        directSettlementEnabled = queuedDirectSettlementToggle.value;
+        bool value = queuedDirectSettlementToggle.value;
+        delete queuedDirectSettlementToggle;
+        emit DirectSettlementToggled(value);
+    }
+
+    function cancelDirectSettlementToggle() external onlyOwner {
+        if (!queuedDirectSettlementToggle.queued) revert NoAdminOperationQueued();
+        bool value = queuedDirectSettlementToggle.value;
+        delete queuedDirectSettlementToggle;
+        emit DirectSettlementToggleCancelled(value);
     }
 
     function setRiskParams(
@@ -199,36 +409,80 @@ contract PerplyArena {
         uint16 newLiquidationPenaltyBps,
         uint16 newLiquidatorRewardShareBps
     ) external onlyOwner {
-        if (newSettlementStrengthBps > BPS) revert InvalidAmount();
-        if (newMaxSettlementTransferBps == 0 || newMaxSettlementTransferBps > BPS) revert InvalidAmount();
-        if (newSettlementFeeBps > 100) revert InvalidAmount(); // <=1%
-        if (newCongestionStartBps >= newCongestionFullBps) revert InvalidAmount();
-        if (newMaxCongestionFeeBps > 2000) revert InvalidAmount(); // <=20%
-        if (newLiquidatorRewardShareBps > BPS) revert InvalidAmount();
+        if (hasQueuedRiskParams) revert RiskParamsAlreadyQueued();
+        _validateRiskParams(
+            newMinSettlementInterval,
+            newVolatilityTriggerBps,
+            newSettlementStrengthBps,
+            newMaxSettlementTransferBps,
+            newOpenFeeBps,
+            newCloseFeeBps,
+            newSettlementFeeBps,
+            newCongestionStartBps,
+            newCongestionFullBps,
+            newMaxCongestionFeeBps,
+            newMaintenanceBaseBps,
+            newMaintenanceLeverageBps,
+            newLiquidationPenaltyBps,
+            newLiquidatorRewardShareBps
+        );
 
-        minSettlementInterval = newMinSettlementInterval;
-        volatilityTriggerBps = newVolatilityTriggerBps;
-        settlementStrengthBps = newSettlementStrengthBps;
-        maxSettlementTransferBps = newMaxSettlementTransferBps;
+        QueuedRiskParams memory cfg = QueuedRiskParams({
+            minSettlementInterval: newMinSettlementInterval,
+            volatilityTriggerBps: newVolatilityTriggerBps,
+            settlementStrengthBps: newSettlementStrengthBps,
+            maxSettlementTransferBps: newMaxSettlementTransferBps,
+            openFeeBps: newOpenFeeBps,
+            closeFeeBps: newCloseFeeBps,
+            settlementFeeBps: newSettlementFeeBps,
+            congestionStartBps: newCongestionStartBps,
+            congestionFullBps: newCongestionFullBps,
+            maxCongestionFeeBps: newMaxCongestionFeeBps,
+            maintenanceBaseBps: newMaintenanceBaseBps,
+            maintenanceLeverageBps: newMaintenanceLeverageBps,
+            liquidationPenaltyBps: newLiquidationPenaltyBps,
+            liquidatorRewardShareBps: newLiquidatorRewardShareBps
+        });
 
-        openFeeBps = newOpenFeeBps;
-        closeFeeBps = newCloseFeeBps;
-        settlementFeeBps = newSettlementFeeBps;
+        bytes32 paramsHash = _hashRiskParams(cfg);
+        queuedRiskParams = cfg;
+        hasQueuedRiskParams = true;
+        queuedRiskParamsEta = block.timestamp + riskParamsTimelockSec;
 
-        congestionStartBps = newCongestionStartBps;
-        congestionFullBps = newCongestionFullBps;
-        maxCongestionFeeBps = newMaxCongestionFeeBps;
+        emit RiskParamsQueued(paramsHash, queuedRiskParamsEta);
+    }
 
-        maintenanceBaseBps = newMaintenanceBaseBps;
-        maintenanceLeverageBps = newMaintenanceLeverageBps;
-        liquidationPenaltyBps = newLiquidationPenaltyBps;
-        liquidatorRewardShareBps = newLiquidatorRewardShareBps;
+    function executeRiskParams() external onlyOwner {
+        if (!hasQueuedRiskParams) revert NoRiskParamsQueued();
+        if (block.timestamp < queuedRiskParamsEta) revert RiskParamsTimelockPending();
+
+        _applyRiskParams(queuedRiskParams);
+
+        delete queuedRiskParams;
+        hasQueuedRiskParams = false;
+        queuedRiskParamsEta = 0;
 
         emit ParamsUpdated();
     }
 
-    function deposit() external payable {
+    function cancelRiskParamsQueue() external onlyOwner {
+        if (!hasQueuedRiskParams) revert NoRiskParamsQueued();
+
+        bytes32 paramsHash = _hashRiskParams(queuedRiskParams);
+        delete queuedRiskParams;
+        hasQueuedRiskParams = false;
+        queuedRiskParamsEta = 0;
+        emit RiskParamsQueueCancelled(paramsHash);
+    }
+
+    function deposit() external payable whenNotPaused {
         _deposit(msg.sender, msg.value);
+    }
+
+    function donateInsurance() external payable {
+        if (msg.value == 0) revert InvalidAmount();
+        _creditInsurance(msg.value);
+        emit InsuranceFunded(msg.sender, msg.value, systemBadDebt);
     }
 
     function withdraw(uint256 amount) external {
@@ -266,7 +520,8 @@ contract PerplyArena {
         totalRequired = margin + openFee + congestionFee;
     }
 
-    function openPosition(uint8 side, uint256 margin, uint32 leverage) external {
+    function openPosition(uint8 side, uint256 margin, uint32 leverage) external whenNotPaused whenNotReduceOnly {
+        if (systemBadDebt > 0) revert SystemInsolvent();
         if (side > SIDE_SHORT) revert InvalidSide();
         if (margin == 0) revert InvalidAmount();
         if (leverage < 2 || leverage > 100) revert InvalidLeverage();
@@ -286,7 +541,7 @@ contract PerplyArena {
 
         uint8 opposite = _opposite(side);
         if (congestionToOpposite > 0 && sideWeight[opposite] > 0) {
-            _applySideDelta(opposite, int256(congestionToOpposite));
+            _applySideDelta(opposite, _toInt256(congestionToOpposite));
             cumulativeCongestionRewards[opposite] += congestionToOpposite;
         } else {
             congestionToTreasury += congestionToOpposite;
@@ -299,7 +554,7 @@ contract PerplyArena {
             margin: margin,
             weight: weight,
             leverage: leverage,
-            entryPriceE8: uint64(markPriceE8),
+            entryPriceE8: _toUint64(markPriceE8),
             entryAccPnlPerWeight: accPnlPerWeight[side],
             isOpen: true
         });
@@ -331,10 +586,10 @@ contract PerplyArena {
         if (!pos.isOpen) revert PositionMissing();
 
         int256 pnl = _positionPnl(pos, side);
-        int256 equitySigned = int256(pos.margin) + pnl;
+        int256 equitySigned = _toInt256(pos.margin) + pnl;
         uint256 maintenance = _maintenanceMargin(pos);
 
-        if (equitySigned > int256(maintenance)) revert NotLiquidatable();
+        if (equitySigned > _toInt256(maintenance)) revert NotLiquidatable();
 
         _removePosition(trader, side, pos);
 
@@ -344,7 +599,7 @@ contract PerplyArena {
         uint256 insuranceReward = 0;
 
         if (equitySigned > 0) {
-            uint256 equity = uint256(equitySigned);
+            uint256 equity = _toUint256(equitySigned);
             liquidationPenalty = (equity * liquidationPenaltyBps) / BPS;
             if (liquidationPenalty > equity) liquidationPenalty = equity;
             liquidatorReward = (liquidationPenalty * liquidatorRewardShareBps) / BPS;
@@ -358,10 +613,10 @@ contract PerplyArena {
                 availableBalance[msg.sender] += liquidatorReward;
             }
             if (insuranceReward > 0) {
-                insuranceFund += insuranceReward;
+                _creditInsurance(insuranceReward);
             }
         } else if (equitySigned < 0) {
-            _coverBadDebt(uint256(-equitySigned));
+            _coverBadDebt(_toAbsUint(equitySigned));
         }
 
         emit PositionLiquidated(
@@ -378,8 +633,30 @@ contract PerplyArena {
     }
 
     function settleWithPrice(uint256 newPriceE8) external {
+        if (!directSettlementEnabled) revert DirectSettlementDisabled();
+        if (msg.sender != keeper && msg.sender != owner) revert UnauthorizedKeeper();
+        _settleWithPrice(newPriceE8);
+    }
+
+    function settleWithSignedPrice(uint256 newPriceE8, uint64 priceTimestamp, uint64 salt, bytes calldata signature) external {
         if (msg.sender != keeper && msg.sender != owner) revert UnauthorizedKeeper();
         if (newPriceE8 == 0) revert InvalidPrice();
+        if (priceTimestamp > block.timestamp) revert StalePrice();
+
+        bytes32 digest = _priceDigest(newPriceE8, priceTimestamp, salt);
+        if (usedPriceDigests[digest]) revert SignatureAlreadyUsed();
+        address recovered = _recoverSigner(digest, signature);
+        if (recovered != priceSigner) revert InvalidSignature();
+        if (block.timestamp - priceTimestamp > maxPriceAgeSec) revert StalePrice();
+        if (priceTimestamp <= lastSettlementAt) revert StalePrice();
+        usedPriceDigests[digest] = true;
+
+        _settleWithPrice(newPriceE8);
+    }
+
+    function _settleWithPrice(uint256 newPriceE8) internal {
+        if (newPriceE8 == 0) revert InvalidPrice();
+        if (newPriceE8 > type(uint64).max) revert PriceOutOfRange();
 
         uint256 oldPrice = markPriceE8;
         if (oldPrice == 0) revert InvalidPrice();
@@ -413,8 +690,8 @@ contract PerplyArena {
                 settlementFee = (grossTransfer * settlementFeeBps) / BPS;
                 winnerNet = grossTransfer - settlementFee;
 
-                _applySideDelta(winnerSide, int256(winnerNet));
-                _applySideDelta(loserSide, -int256(grossTransfer));
+                _applySideDelta(winnerSide, _toInt256(winnerNet));
+                _applySideDelta(loserSide, -_toInt256(grossTransfer));
                 treasuryBalance += settlementFee;
             }
         }
@@ -442,7 +719,7 @@ contract PerplyArena {
         }
 
         int256 pnl = _positionPnl(pos, side);
-        int256 equity = int256(pos.margin) + pnl;
+        int256 equity = _toInt256(pos.margin) + pnl;
 
         pv = PositionView({
             margin: pos.margin,
@@ -482,19 +759,117 @@ contract PerplyArena {
     }
 
     function withdrawTreasury(address payable to, uint256 amount) external onlyOwner {
-        if (to == address(0) || amount == 0 || amount > treasuryBalance) revert InvalidAmount();
+        if (systemBadDebt > 0) revert SystemInsolvent();
+        if (to == address(0) || amount == 0) revert InvalidAmount();
+        if (queuedTreasuryWithdrawal.queued) revert AdminOperationAlreadyQueued();
+        queuedTreasuryWithdrawal = TimelockedWithdrawalOperation({
+            to: to,
+            amount: amount,
+            eta: block.timestamp + adminOpsTimelockSec,
+            queued: true
+        });
+        emit TreasuryWithdrawalQueued(to, amount, queuedTreasuryWithdrawal.eta);
+    }
+
+    function executeTreasuryWithdrawal() external onlyOwner {
+        if (!queuedTreasuryWithdrawal.queued) revert NoAdminOperationQueued();
+        if (block.timestamp < queuedTreasuryWithdrawal.eta) revert AdminOperationTimelockPending();
+        if (systemBadDebt > 0) revert SystemInsolvent();
+
+        address payable to = queuedTreasuryWithdrawal.to;
+        uint256 amount = queuedTreasuryWithdrawal.amount;
+        if (amount > treasuryBalance) revert InvalidAmount();
+
+        delete queuedTreasuryWithdrawal;
         treasuryBalance -= amount;
         (bool ok, ) = to.call{value: amount}("");
         if (!ok) revert TransferFailed();
         emit TreasuryWithdrawn(to, amount);
     }
 
+    function cancelTreasuryWithdrawal() external onlyOwner {
+        if (!queuedTreasuryWithdrawal.queued) revert NoAdminOperationQueued();
+        address to = queuedTreasuryWithdrawal.to;
+        uint256 amount = queuedTreasuryWithdrawal.amount;
+        delete queuedTreasuryWithdrawal;
+        emit TreasuryWithdrawalCancelled(to, amount);
+    }
+
     function withdrawInsurance(address payable to, uint256 amount) external onlyOwner {
-        if (to == address(0) || amount == 0 || amount > insuranceFund) revert InvalidAmount();
+        if (systemBadDebt > 0) revert SystemInsolvent();
+        if (to == address(0) || amount == 0) revert InvalidAmount();
+        if (queuedInsuranceWithdrawal.queued) revert AdminOperationAlreadyQueued();
+        queuedInsuranceWithdrawal = TimelockedWithdrawalOperation({
+            to: to,
+            amount: amount,
+            eta: block.timestamp + adminOpsTimelockSec,
+            queued: true
+        });
+        emit InsuranceWithdrawalQueued(to, amount, queuedInsuranceWithdrawal.eta);
+    }
+
+    function executeInsuranceWithdrawal() external onlyOwner {
+        if (!queuedInsuranceWithdrawal.queued) revert NoAdminOperationQueued();
+        if (block.timestamp < queuedInsuranceWithdrawal.eta) revert AdminOperationTimelockPending();
+        if (systemBadDebt > 0) revert SystemInsolvent();
+
+        address payable to = queuedInsuranceWithdrawal.to;
+        uint256 amount = queuedInsuranceWithdrawal.amount;
+        if (amount > insuranceFund) revert InvalidAmount();
+
+        delete queuedInsuranceWithdrawal;
         insuranceFund -= amount;
         (bool ok, ) = to.call{value: amount}("");
         if (!ok) revert TransferFailed();
         emit InsuranceWithdrawn(to, amount);
+    }
+
+    function cancelInsuranceWithdrawal() external onlyOwner {
+        if (!queuedInsuranceWithdrawal.queued) revert NoAdminOperationQueued();
+        address to = queuedInsuranceWithdrawal.to;
+        uint256 amount = queuedInsuranceWithdrawal.amount;
+        delete queuedInsuranceWithdrawal;
+        emit InsuranceWithdrawalCancelled(to, amount);
+    }
+
+    function getQueuedKeeperUpdate() external view returns (address value, uint256 eta, bool queued) {
+        value = queuedKeeperUpdate.value;
+        eta = queuedKeeperUpdate.eta;
+        queued = queuedKeeperUpdate.queued;
+    }
+
+    function getQueuedPriceSignerUpdate() external view returns (address value, uint256 eta, bool queued) {
+        value = queuedPriceSignerUpdate.value;
+        eta = queuedPriceSignerUpdate.eta;
+        queued = queuedPriceSignerUpdate.queued;
+    }
+
+    function getQueuedDirectSettlementToggle() external view returns (bool value, uint256 eta, bool queued) {
+        value = queuedDirectSettlementToggle.value;
+        eta = queuedDirectSettlementToggle.eta;
+        queued = queuedDirectSettlementToggle.queued;
+    }
+
+    function getQueuedTreasuryWithdrawal()
+        external
+        view
+        returns (address to, uint256 amount, uint256 eta, bool queued)
+    {
+        to = queuedTreasuryWithdrawal.to;
+        amount = queuedTreasuryWithdrawal.amount;
+        eta = queuedTreasuryWithdrawal.eta;
+        queued = queuedTreasuryWithdrawal.queued;
+    }
+
+    function getQueuedInsuranceWithdrawal()
+        external
+        view
+        returns (address to, uint256 amount, uint256 eta, bool queued)
+    {
+        to = queuedInsuranceWithdrawal.to;
+        amount = queuedInsuranceWithdrawal.amount;
+        eta = queuedInsuranceWithdrawal.eta;
+        queued = queuedInsuranceWithdrawal.queued;
     }
 
     function _closePosition(address trader, uint8 side) internal {
@@ -503,7 +878,7 @@ contract PerplyArena {
         if (!pos.isOpen) revert PositionMissing();
 
         int256 pnl = _positionPnl(pos, side);
-        int256 equitySigned = int256(pos.margin) + pnl;
+        int256 equitySigned = _toInt256(pos.margin) + pnl;
 
         _removePosition(trader, side, pos);
 
@@ -511,7 +886,7 @@ contract PerplyArena {
         uint256 payout = 0;
 
         if (equitySigned > 0) {
-            uint256 equity = uint256(equitySigned);
+            uint256 equity = _toUint256(equitySigned);
             closeFee = (equity * closeFeeBps) / BPS;
             if (closeFee > equity) closeFee = equity;
             payout = equity - closeFee;
@@ -520,7 +895,7 @@ contract PerplyArena {
                 availableBalance[trader] += payout;
             }
         } else if (equitySigned < 0) {
-            _coverBadDebt(uint256(-equitySigned));
+            _coverBadDebt(_toAbsUint(equitySigned));
         }
 
         emit PositionClosed(
@@ -544,7 +919,102 @@ contract PerplyArena {
 
     function _positionPnl(Position memory pos, uint8 side) internal view returns (int256) {
         int256 deltaAcc = accPnlPerWeight[side] - pos.entryAccPnlPerWeight;
-        return (int256(pos.weight) * deltaAcc) / PRECISION;
+        return (_toInt256(pos.weight) * deltaAcc) / PRECISION;
+    }
+
+    function _validateRiskParams(
+        uint32 newMinSettlementInterval,
+        uint16 newVolatilityTriggerBps,
+        uint16 newSettlementStrengthBps,
+        uint16 newMaxSettlementTransferBps,
+        uint16 newOpenFeeBps,
+        uint16 newCloseFeeBps,
+        uint16 newSettlementFeeBps,
+        uint16 newCongestionStartBps,
+        uint16 newCongestionFullBps,
+        uint16 newMaxCongestionFeeBps,
+        uint16 newMaintenanceBaseBps,
+        uint16 newMaintenanceLeverageBps,
+        uint16 newLiquidationPenaltyBps,
+        uint16 newLiquidatorRewardShareBps
+    ) internal pure {
+        if (newMinSettlementInterval == 0 || newMinSettlementInterval > 3600) revert InvalidAmount();
+        if (newVolatilityTriggerBps == 0 || newVolatilityTriggerBps > 1000) revert InvalidAmount();
+        if (newSettlementStrengthBps == 0 || newSettlementStrengthBps > BPS) revert InvalidAmount();
+        if (newMaxSettlementTransferBps == 0 || newMaxSettlementTransferBps > BPS) revert InvalidAmount();
+        if (newOpenFeeBps > 500 || newCloseFeeBps > 500) revert InvalidAmount(); // <= 5%
+        if (newSettlementFeeBps > 100) revert InvalidAmount(); // <= 1%
+        if (newCongestionStartBps >= newCongestionFullBps) revert InvalidAmount();
+        if (newMaxCongestionFeeBps > 2000) revert InvalidAmount(); // <= 20%
+        if (newMaintenanceBaseBps > 2500) revert InvalidAmount(); // <= 25%
+        if (newMaintenanceLeverageBps > 200) revert InvalidAmount(); // <= 2% * lev
+        if (newLiquidationPenaltyBps > 3000) revert InvalidAmount(); // <= 30%
+        if (newLiquidatorRewardShareBps > BPS) revert InvalidAmount();
+    }
+
+    function _applyRiskParams(QueuedRiskParams memory cfg) internal {
+        minSettlementInterval = cfg.minSettlementInterval;
+        volatilityTriggerBps = cfg.volatilityTriggerBps;
+        settlementStrengthBps = cfg.settlementStrengthBps;
+        maxSettlementTransferBps = cfg.maxSettlementTransferBps;
+
+        openFeeBps = cfg.openFeeBps;
+        closeFeeBps = cfg.closeFeeBps;
+        settlementFeeBps = cfg.settlementFeeBps;
+
+        congestionStartBps = cfg.congestionStartBps;
+        congestionFullBps = cfg.congestionFullBps;
+        maxCongestionFeeBps = cfg.maxCongestionFeeBps;
+
+        maintenanceBaseBps = cfg.maintenanceBaseBps;
+        maintenanceLeverageBps = cfg.maintenanceLeverageBps;
+        liquidationPenaltyBps = cfg.liquidationPenaltyBps;
+        liquidatorRewardShareBps = cfg.liquidatorRewardShareBps;
+    }
+
+    function _hashRiskParams(QueuedRiskParams memory cfg) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                cfg.minSettlementInterval,
+                cfg.volatilityTriggerBps,
+                cfg.settlementStrengthBps,
+                cfg.maxSettlementTransferBps,
+                cfg.openFeeBps,
+                cfg.closeFeeBps,
+                cfg.settlementFeeBps,
+                cfg.congestionStartBps,
+                cfg.congestionFullBps,
+                cfg.maxCongestionFeeBps,
+                cfg.maintenanceBaseBps,
+                cfg.maintenanceLeverageBps,
+                cfg.liquidationPenaltyBps,
+                cfg.liquidatorRewardShareBps
+            )
+        );
+    }
+
+    function _priceDigest(uint256 newPriceE8, uint64 priceTimestamp, uint64 salt) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(address(this), block.chainid, newPriceE8, priceTimestamp, salt));
+    }
+
+    function _recoverSigner(bytes32 digest, bytes calldata signature) internal pure returns (address signer) {
+        if (signature.length != 65) revert InvalidSignature();
+
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 0x20))
+            v := byte(0, calldataload(add(signature.offset, 0x40)))
+        }
+
+        if (uint256(s) > SECP256K1N_HALF) revert InvalidSignature();
+        if (v != 27 && v != 28) revert InvalidSignature();
+
+        bytes32 ethDigest = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", digest));
+        signer = ecrecover(ethDigest, v, r, s);
+        if (signer == address(0)) revert InvalidSignature();
     }
 
     function _maintenanceMargin(Position memory pos) internal view returns (uint256) {
@@ -565,7 +1035,7 @@ contract PerplyArena {
         if (imbalanceBps >= congestionFullBps) return maxCongestionFeeBps;
 
         uint256 span = congestionFullBps - congestionStartBps;
-        return uint16((uint256(maxCongestionFeeBps) * (imbalanceBps - congestionStartBps)) / span);
+        return _toUint16((uint256(maxCongestionFeeBps) * (imbalanceBps - congestionStartBps)) / span);
     }
 
     function _applySideDelta(uint8 side, int256 amount) internal {
@@ -574,12 +1044,12 @@ contract PerplyArena {
 
         if (weight == 0) {
             if (amount > 0) {
-                treasuryBalance += uint256(amount);
+                treasuryBalance += _toUint256(amount);
             }
             return;
         }
 
-        int256 perWeight = (amount * PRECISION) / int256(weight);
+        int256 perWeight = (amount * PRECISION) / _toInt256(weight);
         accPnlPerWeight[side] += perWeight;
     }
 
@@ -597,7 +1067,22 @@ contract PerplyArena {
             treasuryBalance -= remaining;
             return;
         }
+        uint256 uncovered = remaining - treasuryBalance;
         treasuryBalance = 0;
+        systemBadDebt += uncovered;
+        emit BadDebtRecorded(uncovered, systemBadDebt);
+    }
+
+    function _creditInsurance(uint256 amount) internal {
+        if (amount == 0) return;
+        if (systemBadDebt > 0) {
+            uint256 toDebt = _min(amount, systemBadDebt);
+            systemBadDebt -= toDebt;
+            amount -= toDebt;
+        }
+        if (amount > 0) {
+            insuranceFund += amount;
+        }
     }
 
     function _deposit(address trader, uint256 amount) internal {
@@ -612,5 +1097,36 @@ contract PerplyArena {
 
     function _opposite(uint8 side) internal pure returns (uint8) {
         return side == SIDE_LONG ? SIDE_SHORT : SIDE_LONG;
+    }
+
+    function _toInt256(uint256 value) internal pure returns (int256) {
+        if (value > uint256(type(int256).max)) revert InvalidAmount();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return int256(value);
+    }
+
+    function _toUint256(int256 value) internal pure returns (uint256) {
+        if (value < 0) revert InvalidAmount();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint256(value);
+    }
+
+    function _toAbsUint(int256 value) internal pure returns (uint256) {
+        if (value >= 0) revert InvalidAmount();
+        if (value == type(int256).min) revert InvalidAmount();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint256(-value);
+    }
+
+    function _toUint64(uint256 value) internal pure returns (uint64) {
+        if (value > type(uint64).max) revert PriceOutOfRange();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint64(value);
+    }
+
+    function _toUint16(uint256 value) internal pure returns (uint16) {
+        if (value > type(uint16).max) revert InvalidAmount();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint16(value);
     }
 }

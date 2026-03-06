@@ -9,6 +9,7 @@ import { ethers } from 'ethers';
 import { Zap, Wallet, ChevronDown, ChevronUp, TrendingUp, TrendingDown } from 'lucide-react';
 import BattleCanvas from './components/BattleCanvas';
 import TradingModal from './components/TradingModal';
+import OnboardingTour from './components/OnboardingTour';
 
 import { BattleRecord, UserPositions, Position } from './types';
 import {
@@ -19,19 +20,28 @@ import {
   getArenaAddress,
   getEthereumProvider,
   inferWalletName,
+  getRpcProviderWithFallback,
   MONAD_TESTNET,
   PERPLY_ARENA_ABI,
+  probeMonadRpcUrls,
   WalletProvider,
-  shortenAddress,
-  toPriceE8
+  shortenAddress
 } from './web3/perplyArena';
 
 const DEFAULT_PRICE = 64289.40;
 const DEFAULT_BALANCE = 0;
 const MIN_DEPOSIT_MON = 10;
+const ONBOARDING_STORAGE_KEY = 'perply_onboarding_hidden_v1';
 const PRICE_HISTORY_POINTS = 40;
 const MARKET_POLL_MS = 3000;
-const DEFAULT_PYTH_BTC_PRICE_ID = '0xe62df6c8b4a85fe1fef3f1a6d5af3f4820553a4f8f8036f2fa14de3cd59adf04';
+const DEFAULT_PYTH_BTC_PRICE_ID = '0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43';
+const CHAINLINK_MAX_STALENESS_SEC = 90;
+const HTTP_TIMEOUT_MS = 2000;
+const COINGECKO_CACHE_TTL_MS = 30_000;
+const COINGECKO_STALE_TTL_MS = 120_000;
+
+let cachedCoingeckoPrice: number | null = null;
+let cachedCoingeckoAt = 0;
 
 interface PriceAggregate {
   price: number;
@@ -45,6 +55,7 @@ interface OpenPreview {
   congestionToOpposite: number;
   congestionToTreasury: number;
   totalRequired: number;
+  totalRequiredWei: bigint;
 }
 
 interface SettlementRow {
@@ -68,11 +79,52 @@ interface CongestionRow {
   toTreasury: number;
 }
 
+function deriveBattleBiasFromPrice(nextPrice: number, prevPrice: number, history: number[]): number {
+  if (!Number.isFinite(nextPrice) || nextPrice <= 0 || !Number.isFinite(prevPrice) || prevPrice <= 0) {
+    return 0;
+  }
+
+  // Short-window momentum keeps the frontline moving with price direction even without liquidity data.
+  const lookback = Math.min(8, Math.max(1, history.length - 1));
+  const anchorIndex = Math.max(0, history.length - 1 - lookback);
+  const anchorPrice = history[anchorIndex] > 0 ? history[anchorIndex] : prevPrice;
+
+  const instantPct = (nextPrice - prevPrice) / prevPrice;
+  const momentumPct = (nextPrice - anchorPrice) / anchorPrice;
+  const instantBps = instantPct * 10_000;
+  const momentumBps = momentumPct * 10_000;
+
+  // Make frontline response obvious even for small BTC ticks.
+  const raw = instantBps * 0.12 + momentumBps * 0.07;
+  let bias = Math.max(-1, Math.min(1, Math.tanh(raw)));
+
+  // Ensure micro moves still create visible directional movement.
+  if (Math.abs(instantBps) >= 0.15 && Math.abs(bias) < 0.06) {
+    bias = 0.06 * Math.sign(instantBps);
+  }
+  return bias;
+}
+
+async function fetchJsonWithTimeout(url: string, timeoutMs = HTTP_TIMEOUT_MS): Promise<unknown> {
+  const controller = new AbortController();
+  const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    globalThis.clearTimeout(timer);
+  }
+}
+
 async function fetchBinancePrice(): Promise<number | null> {
   try {
-    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
-    if (!res.ok) return null;
-    const data = await res.json() as { price?: string };
+    const data = await fetchJsonWithTimeout('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT') as {
+      price?: string;
+    } | null;
+    if (!data) return null;
     const price = Number(data.price);
     return Number.isFinite(price) && price > 0 ? price : null;
   } catch {
@@ -81,30 +133,52 @@ async function fetchBinancePrice(): Promise<number | null> {
 }
 
 async function fetchCoingeckoPrice(): Promise<number | null> {
+  const now = Date.now();
+  if (cachedCoingeckoPrice !== null && now - cachedCoingeckoAt < COINGECKO_CACHE_TTL_MS) {
+    return cachedCoingeckoPrice;
+  }
   try {
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
-    if (!res.ok) return null;
-    const data = await res.json() as { bitcoin?: { usd?: number } };
-    const price = Number(data.bitcoin?.usd);
-    return Number.isFinite(price) && price > 0 ? price : null;
+    const data = await fetchJsonWithTimeout('/api/market/coingecko') as {
+      ok?: boolean;
+      price?: number;
+    } | null;
+    if (!data) {
+      if (cachedCoingeckoPrice !== null && now - cachedCoingeckoAt < COINGECKO_STALE_TTL_MS) {
+        return cachedCoingeckoPrice;
+      }
+      return null;
+    }
+    if (data.ok !== true) return null;
+    const price = Number(data.price);
+    if (!Number.isFinite(price) || price <= 0) return null;
+    cachedCoingeckoPrice = price;
+    cachedCoingeckoAt = now;
+    return price;
   } catch {
+    if (cachedCoingeckoPrice !== null && now - cachedCoingeckoAt < COINGECKO_STALE_TTL_MS) {
+      return cachedCoingeckoPrice;
+    }
     return null;
   }
 }
 
 async function fetchPythPrice(): Promise<number | null> {
   try {
-    const pythPriceId = import.meta.env.VITE_PYTH_BTC_PRICE_ID || DEFAULT_PYTH_BTC_PRICE_ID;
-    const url = `https://hermes.pyth.network/v2/updates/price/latest?ids[]=${pythPriceId}`;
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const data = await res.json() as {
-      parsed?: Array<{ price?: { price?: string; expo?: number } }>;
-    };
-    const entry = data.parsed?.[0]?.price;
-    if (!entry?.price || entry.expo === undefined) return null;
-    const value = Number(entry.price) * Math.pow(10, entry.expo);
-    return Number.isFinite(value) && value > 0 ? value : null;
+    const configured = import.meta.env.VITE_PYTH_BTC_PRICE_ID?.trim();
+    const candidateIds = Array.from(new Set([DEFAULT_PYTH_BTC_PRICE_ID, configured].filter(Boolean))) as string[];
+
+    for (const pythPriceId of candidateIds) {
+      const url = `https://hermes.pyth.network/v2/updates/price/latest?ids[]=${pythPriceId}`;
+      const data = await fetchJsonWithTimeout(url) as {
+        parsed?: Array<{ price?: { price?: string; expo?: number } }>;
+      } | null;
+      if (!data) continue;
+      const entry = data.parsed?.[0]?.price;
+      if (!entry?.price || entry.expo === undefined) continue;
+      const value = Number(entry.price) * Math.pow(10, entry.expo);
+      if (Number.isFinite(value) && value > 0) return value;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -114,16 +188,28 @@ async function fetchChainlinkPrice(): Promise<number | null> {
   try {
     const feedAddress = import.meta.env.VITE_CHAINLINK_BTC_USD_FEED;
     if (!feedAddress) return null;
-    const provider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
+    const maxStaleness = Number(import.meta.env.VITE_CHAINLINK_MAX_STALENESS_SEC ?? CHAINLINK_MAX_STALENESS_SEC);
+    if (!Number.isFinite(maxStaleness) || maxStaleness <= 0) return null;
+    const provider = await getRpcProviderWithFallback();
     const feed = new ethers.Contract(
       feedAddress,
-      ['function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)'],
+      ['function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)'],
       provider
     );
     const round = await feed.latestRoundData() as [bigint, bigint, bigint, bigint, bigint];
-    const answer = Number(round[1]);
-    if (!Number.isFinite(answer) || answer <= 0) return null;
-    return answer / 1e8;
+    const roundId = round[0];
+    const answer = round[1];
+    const updatedAt = round[3];
+    const answeredInRound = round[4];
+    if (answer <= 0n) return null;
+    if (updatedAt === 0n) return null;
+    if (answeredInRound < roundId) return null;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const ageSec = nowSec - Number(updatedAt);
+    if (!Number.isFinite(ageSec) || ageSec < 0 || ageSec > maxStaleness) return null;
+    const asNumber = Number(answer);
+    if (!Number.isFinite(asNumber) || asNumber <= 0) return null;
+    return asNumber / 1e8;
   } catch {
     return null;
   }
@@ -164,7 +250,11 @@ export default function App() {
   const [allianceLiquidity, setAllianceLiquidity] = useState(0);
   const [syndicateLiquidity, setSyndicateLiquidity] = useState(0);
   const [trend, setTrend] = useState<'bull' | 'bear' | 'neutral'>('neutral');
-  const [latestPnL, setLatestPnL] = useState<{ faction: 'left' | 'right'; amount: string } | null>(null);
+  const [latestPnL, setLatestPnL] = useState<{
+    faction: 'left' | 'right';
+    amount: string;
+    kind: 'settlement' | 'congestion';
+  } | null>(null);
   const [battleHistory, setBattleHistory] = useState<BattleRecord[]>([]);
   const [isGlitching, setIsGlitching] = useState(false);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
@@ -182,17 +272,20 @@ export default function App() {
   const [shortCongestionRewards, setShortCongestionRewards] = useState(0);
   const [contractOwner, setContractOwner] = useState<string | null>(null);
   const [contractKeeper, setContractKeeper] = useState<string | null>(null);
-  const [minSettlementIntervalSec, setMinSettlementIntervalSec] = useState(10);
+  const [minSettlementIntervalSec, setMinSettlementIntervalSec] = useState(3);
   const [volatilityTriggerPct, setVolatilityTriggerPct] = useState(0.15);
   const [lastSettlementAt, setLastSettlementAt] = useState<number | null>(null);
-  const [isAutoKeeperEnabled, setIsAutoKeeperEnabled] = useState(false);
   const [recentSettlements, setRecentSettlements] = useState<SettlementRow[]>([]);
   const [recentCongestionFees, setRecentCongestionFees] = useState<CongestionRow[]>([]);
+  const [rpcHealthText, setRpcHealthText] = useState('RPC: checking...');
   const [showWalletMenu, setShowWalletMenu] = useState(false);
   const [isTradingModalOpen, setIsTradingModalOpen] = useState(false);
   const [tradingSide, setTradingSide] = useState<'long' | 'short'>('long');
+  const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
+  const [isArenaStatsOpen, setIsArenaStatsOpen] = useState(false);
 
   const [userBalance, setUserBalance] = useState(DEFAULT_BALANCE);
+  const [userAvailableWei, setUserAvailableWei] = useState<bigint>(0n);
   const [userPositions, setUserPositions] = useState<UserPositions>({
     long: null,
     short: null
@@ -223,16 +316,25 @@ export default function App() {
     }).format(val);
   };
 
-  const parseAmountInput = (raw: string | null): number | null => {
+  const parseAmountInput = (raw: string | null): string | null => {
     if (raw === null) return null;
     const normalized = raw.trim().replace(',', '.');
     if (!normalized) return null;
-    const amount = Number(normalized);
-    if (!Number.isFinite(amount) || amount <= 0) {
+    if (!/^\d+(\.\d{1,18})?$/.test(normalized)) {
       setWalletError('Invalid amount. Example: 0.1');
       return null;
     }
-    return amount;
+    try {
+      const parsed = ethers.parseEther(normalized);
+      if (parsed <= 0n) {
+        setWalletError('Invalid amount. Example: 0.1');
+        return null;
+      }
+    } catch {
+      setWalletError('Invalid amount. Example: 0.1');
+      return null;
+    }
+    return normalized;
   };
 
   const toReadableError = (error: unknown, fallback: string): string => {
@@ -396,6 +498,7 @@ export default function App() {
   const refreshOnchainState = async (addressOverride?: string) => {
     if (!arenaAddress) {
       setUserBalance(DEFAULT_BALANCE);
+      setUserAvailableWei(0n);
       setUserPositions({ long: null, short: null });
       setLongCongestionRateBps(0);
       setShortCongestionRateBps(0);
@@ -403,7 +506,6 @@ export default function App() {
       setShortCongestionRewards(0);
       setAllianceLiquidity(0);
       setSyndicateLiquidity(0);
-      setDominance(0);
       setContractOwner(null);
       setContractKeeper(null);
       setLastSettlementAt(null);
@@ -414,7 +516,7 @@ export default function App() {
     const trader = addressOverride ?? walletAddress ?? ethers.ZeroAddress;
 
     try {
-      const readProvider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
+      const readProvider = await getRpcProviderWithFallback();
       const readContract = new ethers.Contract(arenaAddress, PERPLY_ARENA_ABI, readProvider);
       const emptyPosition = {
         margin: 0n,
@@ -494,10 +596,10 @@ export default function App() {
       if (allRequiredReadsFailed) {
         setWalletError('Cannot read arena contract. Verify contract address and Monad testnet network.');
         setUserBalance(DEFAULT_BALANCE);
+        setUserAvailableWei(0n);
         setUserPositions({ long: null, short: null });
         setAllianceLiquidity(0);
         setSyndicateLiquidity(0);
-        setDominance(0);
         setRecentSettlements([]);
         setRecentCongestionFees([]);
         return;
@@ -513,6 +615,7 @@ export default function App() {
       const shortWeight = shortWeightResult.status === 'fulfilled' ? shortWeightResult.value : 0n;
 
       setUserBalance(Number(ethers.formatEther(available)));
+      setUserAvailableWei(available);
       setUserPositions({
         long: mapOnchainPosition(longPos, 'long'),
         short: mapOnchainPosition(shortPos, 'short')
@@ -520,7 +623,7 @@ export default function App() {
       setContractOwner(ownerResult.status === 'fulfilled' ? ownerResult.value : null);
       setContractKeeper(keeperResult.status === 'fulfilled' ? keeperResult.value : null);
       setLastSettlementAt(lastSettleResult.status === 'fulfilled' ? Number(lastSettleResult.value) : null);
-      setMinSettlementIntervalSec(minIntervalResult.status === 'fulfilled' ? Number(minIntervalResult.value) : 10);
+      setMinSettlementIntervalSec(minIntervalResult.status === 'fulfilled' ? Number(minIntervalResult.value) : 3);
       setVolatilityTriggerPct(volTriggerBpsResult.status === 'fulfilled' ? Number(volTriggerBpsResult.value) / 100 : 0.15);
       if (markPriceResult.status === 'fulfilled') {
         setOnchainMarkPrice(fromPriceE8(markPriceResult.value));
@@ -535,8 +638,6 @@ export default function App() {
       const shortLiquidity = Number(ethers.formatEther(shortWeight));
       setAllianceLiquidity(longLiquidity);
       setSyndicateLiquidity(shortLiquidity);
-      const totalLiquidity = longLiquidity + shortLiquidity;
-      setDominance(totalLiquidity > 0 ? (longLiquidity - shortLiquidity) / totalLiquidity : 0);
       await refreshArenaHistory(readProvider, readContract);
       setWalletError(null);
     } catch (error) {
@@ -582,9 +683,10 @@ export default function App() {
       return;
     }
     const input = window.prompt(`Deposit MON amount (min ${MIN_DEPOSIT_MON})`, `${MIN_DEPOSIT_MON}`);
-    const amount = parseAmountInput(input);
-    if (!amount) return;
-    if (amount < MIN_DEPOSIT_MON) {
+    const amountInput = parseAmountInput(input);
+    if (!amountInput) return;
+    const value = ethers.parseEther(amountInput);
+    if (value < ethers.parseEther(MIN_DEPOSIT_MON.toString())) {
       setWalletError(`Minimum deposit is ${MIN_DEPOSIT_MON} MON`);
       return;
     }
@@ -596,7 +698,6 @@ export default function App() {
       const browserProvider = new ethers.BrowserProvider(provider);
       const signer = await browserProvider.getSigner();
       const walletNativeBalance = await browserProvider.getBalance(await signer.getAddress());
-      const value = ethers.parseEther(amount.toString());
       if (walletNativeBalance < value) {
         setWalletError('Wallet MON balance is lower than deposit amount');
         return;
@@ -621,9 +722,10 @@ export default function App() {
       return;
     }
     const input = window.prompt('Withdraw MON amount', '1');
-    const amount = parseAmountInput(input);
-    if (!amount) return;
-    if (amount > userBalance) {
+    const amountInput = parseAmountInput(input);
+    if (!amountInput) return;
+    const amountWei = ethers.parseEther(amountInput);
+    if (amountWei > userAvailableWei) {
       setWalletError(`Insufficient contract available balance: ${formatFixedAmount(userBalance, 2)} MON`);
       return;
     }
@@ -631,7 +733,7 @@ export default function App() {
     try {
       setIsTxPending(true);
       const contract = await getWriteContract();
-      const tx = await contract.withdraw(ethers.parseEther(amount.toString()));
+      const tx = await contract.withdraw(amountWei);
       await tx.wait();
       await refreshOnchainState();
       window.setTimeout(() => { void refreshOnchainState(); }, 1200);
@@ -639,26 +741,6 @@ export default function App() {
       setWalletError(null);
     } catch (error) {
       setWalletError(toReadableError(error, 'Withdraw failed'));
-    } finally {
-      setIsTxPending(false);
-    }
-  };
-
-  const handleSyncOnchainPrice = async () => {
-    if (!isWalletConnected) return;
-    if (!isKeeperAuthorized) {
-      setWalletError('Connected wallet is not owner/keeper');
-      return;
-    }
-    try {
-      setIsTxPending(true);
-      const contract = await getWriteContract();
-      const tx = await contract.settleWithPrice(toPriceE8(price));
-      await tx.wait();
-      await refreshOnchainState();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Settlement tick failed';
-      setWalletError(message);
     } finally {
       setIsTxPending(false);
     }
@@ -679,6 +761,21 @@ export default function App() {
     setWalletError(null);
     setIsWalletPickerOpen(true);
   };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      if (window.localStorage.getItem(ONBOARDING_STORAGE_KEY) === '1') return;
+    } catch {
+      // localStorage may be blocked in restricted browsing contexts
+    }
+
+    const timer = window.setTimeout(() => {
+      setIsOnboardingOpen(true);
+    }, 280);
+
+    return () => window.clearTimeout(timer);
+  }, []);
 
   // Detect wallet session on load
   useEffect(() => {
@@ -725,6 +822,7 @@ export default function App() {
         setWalletAddress(null);
         setShowWalletMenu(false);
         setUserBalance(DEFAULT_BALANCE);
+        setUserAvailableWei(0n);
         setUserPositions({ long: null, short: null });
       }
     };
@@ -746,21 +844,34 @@ export default function App() {
   // Live market data loop (Binance / Pyth / Chainlink / CoinGecko aggregate)
   useEffect(() => {
     let active = true;
+    let timer: number | null = null;
+
+    const scheduleNext = (delayMs: number) => {
+      if (!active) return;
+      timer = window.setTimeout(() => {
+        void updateMarket();
+      }, delayMs);
+    };
+
     const updateMarket = async () => {
       const aggregate = await fetchBtcPrice();
       if (!active) return;
       if (!aggregate) {
         setPriceFeedStatus('degraded');
+        scheduleNext(8_000);
         return;
       }
 
-      setPriceFeedStatus(aggregate.sourceCount >= 2 ? 'live' : 'degraded');
+      const hasEnoughSources = aggregate.sourceCount >= 2;
+      setPriceFeedStatus(hasEnoughSources ? 'live' : 'degraded');
       setPrice(prevPrice => {
         const nextPrice = aggregate.price;
         const delta = nextPrice - prevPrice;
         setPriceHistory(prev => {
           const newHistory = [...prev, nextPrice];
           if (newHistory.length > PRICE_HISTORY_POINTS) newHistory.shift();
+          const nextBias = deriveBattleBiasFromPrice(nextPrice, prevPrice, newHistory);
+          setDominance(prevDom => Math.max(-1, Math.min(1, prevDom * 0.45 + nextBias * 0.9)));
           return newHistory;
         });
 
@@ -779,12 +890,42 @@ export default function App() {
 
         return nextPrice;
       });
+      scheduleNext(hasEnoughSources ? MARKET_POLL_MS : 6_000);
     };
 
     void updateMarket();
+
+    return () => {
+      active = false;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const updateRpcHealth = async () => {
+      try {
+        const probes = await probeMonadRpcUrls();
+        if (!active) return;
+        if (probes.length === 0) {
+          setRpcHealthText('RPC: 0/0 healthy');
+          return;
+        }
+        const healthy = probes.filter(item => item.ok).length;
+        setRpcHealthText(`RPC: ${healthy}/${probes.length} healthy`);
+      } catch {
+        if (active) {
+          setRpcHealthText('RPC: probe failed');
+        }
+      }
+    };
+
+    void updateRpcHealth();
     const interval = window.setInterval(() => {
-      void updateMarket();
-    }, MARKET_POLL_MS);
+      void updateRpcHealth();
+    }, 20_000);
 
     return () => {
       active = false;
@@ -800,39 +941,6 @@ export default function App() {
     }, 8000);
     return () => window.clearInterval(interval);
   }, [walletAddress, arenaAddress]);
-
-  useEffect(() => {
-    if (!isAutoKeeperEnabled) return;
-    if (!isWalletConnected || !isKeeperAuthorized || !isContractConfigured) return;
-
-    const interval = window.setInterval(() => {
-      if (isTxPending) return;
-      if (!onchainMarkPrice || !Number.isFinite(onchainMarkPrice) || onchainMarkPrice <= 0) return;
-
-      const nowSec = Math.floor(Date.now() / 1000);
-      const elapsed = lastSettlementAt ? nowSec - lastSettlementAt : Number.MAX_SAFE_INTEGER;
-      const deltaPct = Math.abs(price - onchainMarkPrice) / onchainMarkPrice * 100;
-      const meetsTime = elapsed >= minSettlementIntervalSec;
-      const meetsVol = deltaPct >= volatilityTriggerPct;
-
-      if (meetsTime || meetsVol) {
-        void handleSyncOnchainPrice();
-      }
-    }, 2000);
-
-    return () => window.clearInterval(interval);
-  }, [
-    isAutoKeeperEnabled,
-    isWalletConnected,
-    isKeeperAuthorized,
-    isContractConfigured,
-    isTxPending,
-    onchainMarkPrice,
-    price,
-    lastSettlementAt,
-    minSettlementIntervalSec,
-    volatilityTriggerPct
-  ]);
 
   useEffect(() => {
     const settlementRecords = recentSettlements
@@ -870,19 +978,31 @@ export default function App() {
 
     setBattleHistory(merged);
     if (merged.length > 0) {
-      setLatestPnL({ faction: merged[0].faction, amount: merged[0].amount });
+      setLatestPnL({
+        faction: merged[0].faction,
+        amount: merged[0].amount,
+        kind: merged[0].kind
+      });
     } else {
       setLatestPnL(null);
     }
   }, [recentSettlements, recentCongestionFees]);
 
-  const getOpenPreview = async (side: 'long' | 'short', margin: number, leverage: number): Promise<OpenPreview | null> => {
-    if (!arenaAddress || margin <= 0 || leverage <= 0) return null;
+  const getOpenPreview = async (side: 'long' | 'short', marginInput: string, leverage: number): Promise<OpenPreview | null> => {
+    if (!arenaAddress || leverage <= 0) return null;
+    if (!/^\d+(\.\d{1,18})?$/.test(marginInput)) return null;
+    let marginWei: bigint;
     try {
-      const provider = new ethers.JsonRpcProvider(MONAD_TESTNET.rpcUrls[0]);
+      marginWei = ethers.parseEther(marginInput);
+    } catch {
+      return null;
+    }
+    if (marginWei <= 0n) return null;
+    try {
+      const provider = await getRpcProviderWithFallback();
       const contract = new ethers.Contract(arenaAddress, PERPLY_ARENA_ABI, provider);
       const sideId = side === 'long' ? 0 : 1;
-      const result = await contract.previewOpen(sideId, ethers.parseEther(margin.toString()), leverage) as [
+      const result = await contract.previewOpen(sideId, marginWei, leverage) as [
         bigint,
         bigint,
         bigint,
@@ -896,18 +1016,19 @@ export default function App() {
         congestionFee: Number(ethers.formatEther(result[2])),
         congestionToOpposite: Number(ethers.formatEther(result[3])),
         congestionToTreasury: Number(ethers.formatEther(result[4])),
-        totalRequired: Number(ethers.formatEther(result[5]))
+        totalRequired: Number(ethers.formatEther(result[5])),
+        totalRequiredWei: result[5]
       };
     } catch {
       return null;
     }
   };
 
-  const handlePreviewRequest = async (margin: number, leverage: number): Promise<OpenPreview | null> => {
+  const handlePreviewRequest = async (marginInput: string, leverage: number): Promise<OpenPreview | null> => {
     if (!isContractConfigured) {
       return null;
     }
-    const preview = await getOpenPreview(tradingSide, margin, leverage);
+    const preview = await getOpenPreview(tradingSide, marginInput, leverage);
     return preview;
   };
 
@@ -919,6 +1040,17 @@ export default function App() {
     setShowWalletMenu(prev => !prev);
   };
 
+  const handleOnboardingClose = (remember: boolean) => {
+    if (remember && typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem(ONBOARDING_STORAGE_KEY, '1');
+      } catch {
+        // localStorage write failure should not block closing onboarding
+      }
+    }
+    setIsOnboardingOpen(false);
+  };
+
   const handleDisconnect = () => {
     setWalletAddress(null);
     setWalletProvider(null);
@@ -926,8 +1058,8 @@ export default function App() {
     setWalletError(null);
     setIsWalletPickerOpen(false);
     setShowWalletMenu(false);
-    setIsAutoKeeperEnabled(false);
     setUserBalance(DEFAULT_BALANCE);
+    setUserAvailableWei(0n);
     setUserPositions({ long: null, short: null });
   };
 
@@ -964,11 +1096,15 @@ export default function App() {
     setIsTradingModalOpen(true);
   };
 
-  const confirmTrading = async (margin: number, leverage: number) => {
+  const confirmTrading = async (marginInput: string, leverage: number) => {
     if (!isWalletConnected || !isContractConfigured) return;
 
-    const preview = await getOpenPreview(tradingSide, margin, leverage);
-    if (!preview || margin <= 0 || preview.totalRequired > userBalance) {
+    if (!/^\d+(\.\d{1,18})?$/.test(marginInput)) {
+      setWalletError('Invalid margin input');
+      return;
+    }
+    const preview = await getOpenPreview(tradingSide, marginInput, leverage);
+    if (!preview || preview.totalRequiredWei > userAvailableWei) {
       return;
     }
 
@@ -976,7 +1112,7 @@ export default function App() {
       setIsTxPending(true);
       const contract = await getWriteContract();
       const sideId = tradingSide === 'long' ? 0 : 1;
-      const marginWei = ethers.parseEther(margin.toString());
+      const marginWei = ethers.parseEther(marginInput);
       const tx = await contract.openPosition(sideId, marginWei, leverage);
       await tx.wait();
       setIsTradingModalOpen(false);
@@ -1106,6 +1242,12 @@ export default function App() {
                   </div>
                 </div>
               )}
+              <button
+                onClick={() => setIsOnboardingOpen(true)}
+                className="h-8 px-3 rounded-sm border border-neon-yellow/35 bg-neon-yellow/10 text-[10px] font-mono uppercase tracking-[0.2em] text-neon-yellow hover:bg-neon-yellow/20 transition-all"
+              >
+                Guide
+              </button>
               <div className="relative">
                 <button
                   onClick={handleWalletClick}
@@ -1222,22 +1364,9 @@ export default function App() {
                         Withdraw Assets
                       </button>
                       {isKeeperAuthorized && (
-                        <>
-                          <button
-                            onClick={handleSyncOnchainPrice}
-                            disabled={isTxPending}
-                            className="w-full py-2 bg-neon-green/10 hover:bg-neon-green/20 border border-neon-green/30 rounded-sm text-[9px] text-neon-green font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-                          >
-                            Run Settlement Tick
-                          </button>
-                          <button
-                            onClick={() => setIsAutoKeeperEnabled(prev => !prev)}
-                            disabled={isTxPending}
-                            className="w-full py-2 bg-neon-yellow/10 hover:bg-neon-yellow/20 border border-neon-yellow/30 rounded-sm text-[9px] text-neon-yellow font-black uppercase tracking-widest transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-                          >
-                            {isAutoKeeperEnabled ? 'Auto Keeper: ON' : 'Auto Keeper: OFF'}
-                          </button>
-                        </>
+                        <div className="w-full py-2 px-2 text-[8px] text-neon-yellow/80 border border-neon-yellow/20 bg-neon-yellow/5 rounded-sm font-mono">
+                          Keeper settlement is disabled in browser UI. Use an off-chain signer service.
+                        </div>
                       )}
                       <button
                         onClick={handleDisconnect}
@@ -1344,12 +1473,27 @@ export default function App() {
                 <div className={`mt-2 md:mt-3 px-2 md:px-3 py-1 text-white text-[8px] md:text-[10px] font-bold rounded animate-pulse z-10 ${trend === 'bull' ? 'bg-neon-green/80' : 'bg-crimson-red/80'}`}>
                   {trend === 'bull' ? 'BULLISH MOMENTUM' : 'BEARISH PRESSURE'}
                 </div>
-                <div className="mt-2 text-[8px] text-zinc-400 font-mono tracking-wider z-10">
-                  On-chain Mark: {onchainMarkPrice ? formatCurrency(onchainMarkPrice) : 'N/A'}
-                </div>
-                <div className="mt-1 text-[8px] text-zinc-500 font-mono tracking-wider z-10">
-                  Tick: {minSettlementIntervalSec}s | Trigger: {volatilityTriggerPct.toFixed(2)}% | Keeper: {isKeeperAuthorized ? (isAutoKeeperEnabled ? 'AUTO' : 'MANUAL') : 'SYSTEM'}
-                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsArenaStatsOpen(prev => !prev)}
+                  className="mt-2 inline-flex items-center gap-1 rounded border border-white/15 bg-black/40 px-2 py-1 text-[8px] font-mono uppercase tracking-[0.18em] text-zinc-400 transition hover:border-white/30 hover:text-zinc-200 z-10"
+                >
+                  Arena Stats
+                  {isArenaStatsOpen ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+                </button>
+                {isArenaStatsOpen && (
+                  <div className="mt-2 w-full rounded border border-white/10 bg-black/45 px-2 py-1.5 z-10">
+                    <div className="text-[8px] text-zinc-400 font-mono tracking-wider">
+                      On-chain Mark: {onchainMarkPrice ? formatCurrency(onchainMarkPrice) : 'N/A'}
+                    </div>
+                    <div className="mt-1 text-[8px] text-zinc-500 font-mono tracking-wider">
+                      Tick: {minSettlementIntervalSec}s | Trigger: {volatilityTriggerPct.toFixed(2)}% | Keeper: OFF-CHAIN SIGNER
+                    </div>
+                    <div className="mt-1 text-[8px] text-zinc-500 font-mono tracking-wider">
+                      {rpcHealthText}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Betting Controls */}
@@ -1434,8 +1578,8 @@ export default function App() {
               <div className="bg-black/70 border border-white/10 backdrop-blur-md rounded-lg p-3 space-y-3 shadow-[0_0_25px_rgba(0,0,0,0.5)]">
                 <div className="flex items-center justify-between">
                   <span className="text-[9px] uppercase tracking-[0.2em] text-zinc-400 font-bold">Settlement Feed</span>
-                  <span className={`text-[8px] font-mono ${isKeeperAuthorized ? (isAutoKeeperEnabled ? 'text-neon-green' : 'text-zinc-500') : 'text-zinc-500'}`}>
-                    {isKeeperAuthorized ? (isAutoKeeperEnabled ? 'AUTO' : 'MANUAL') : 'SYSTEM'}
+                  <span className="text-[8px] font-mono text-zinc-500">
+                    OFFCHAIN
                   </span>
                 </div>
                 <div className="space-y-1 max-h-32 overflow-y-auto scrollbar-none">
@@ -1502,6 +1646,10 @@ export default function App() {
         isTxPending={isTxPending}
         onConfirm={confirmTrading}
         onPreview={handlePreviewRequest}
+      />
+      <OnboardingTour
+        isOpen={isOnboardingOpen}
+        onClose={handleOnboardingClose}
       />
     </>
   );

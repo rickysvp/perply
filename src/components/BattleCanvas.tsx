@@ -1,8 +1,8 @@
 import { useEffect, useRef } from 'react';
 
 interface BattleCanvasProps {
-  dominance: number; // -1 (full red) to 1 (full green)
-  latestPnL: { faction: 'left' | 'right'; amount: string } | null;
+  dominance: number; // -1 (bear/left shift) to 1 (bull/right shift), driven by price movement
+  latestPnL: { faction: 'left' | 'right'; amount: string; kind: 'settlement' | 'congestion' } | null;
   allianceLiquidity: number;
   syndicateLiquidity: number;
   trend: 'bull' | 'bear' | 'neutral';
@@ -17,6 +17,8 @@ export default function BattleCanvas({ dominance, latestPnL, allianceLiquidity, 
   const currentDominanceRef = useRef(dominance); // For smooth interpolation
   const liquidityRef = useRef({ alliance: allianceLiquidity, syndicate: syndicateLiquidity });
   const trendRef = useRef(trend);
+  const impactRef = useRef(0); // settlement shock offset impulse
+  const waveBoostRef = useRef(0); // temporary wave intensity boost
 
   useEffect(() => {
     dominanceRef.current = dominance;
@@ -43,7 +45,7 @@ export default function BattleCanvas({ dominance, latestPnL, allianceLiquidity, 
     
     pnl.className = `absolute font-mono font-black text-4xl animate-float-up pointer-events-none select-none z-50`;
     
-    // Position based on interpolated dominance
+    // Position based on price-driven frontline bias
     const centerOffset = (width * 0.4) * currentDominanceRef.current;
     const centerX = width / 2 + centerOffset;
     
@@ -63,10 +65,26 @@ export default function BattleCanvas({ dominance, latestPnL, allianceLiquidity, 
     setTimeout(() => pnl.remove(), 2000); // Lasts 2 seconds
   };
 
+  const triggerBattleImpact = (side: 'left' | 'right', amountRaw: string, kind: 'settlement' | 'congestion') => {
+    const normalized = Number(amountRaw.replace(/,/g, ''));
+    const amount = Number.isFinite(normalized) ? Math.max(0, normalized) : 0;
+    const direction = side === 'left' ? 1 : -1;
+
+    // Settlements should feel significantly stronger than congestion transfers.
+    const baseKick = kind === 'settlement' ? 0.34 : 0.08;
+    const maxKick = kind === 'settlement' ? 0.75 : 0.22;
+    const scaledKick = Math.min(maxKick, baseKick + Math.log10(amount + 1) * 0.12);
+    impactRef.current = Math.max(-1, Math.min(1, impactRef.current + direction * scaledKick));
+
+    const boost = kind === 'settlement' ? 0.9 : 0.25;
+    waveBoostRef.current = Math.max(0, Math.min(1.2, waveBoostRef.current + boost));
+  };
+
   // Handle PnL Spawning via Prop
   useEffect(() => {
     if (latestPnL) {
-        spawnPnL(latestPnL.faction, latestPnL.amount);
+      spawnPnL(latestPnL.faction, latestPnL.amount);
+      triggerBattleImpact(latestPnL.faction, latestPnL.amount, latestPnL.kind);
     }
   }, [latestPnL]);
 
@@ -120,9 +138,10 @@ export default function BattleCanvas({ dominance, latestPnL, allianceLiquidity, 
       }
 
       updateTarget() {
-        // The frontline moves based on interpolated dominance
-        const centerOffset = (width * 0.4) * currentDominanceRef.current;
-        const centerX = width / 2 + centerOffset;
+        // The frontline moves based on interpolated price bias
+        const centerOffset = (width * 0.44) * currentDominanceRef.current;
+        const shockOffset = impactRef.current * width * 0.16;
+        const centerX = Math.max(width * 0.1, Math.min(width * 0.9, width / 2 + centerOffset + shockOffset));
         
         this.targetX = centerX;
         this.targetY = height / 2 + (Math.random() - 0.5) * (height * 0.8);
@@ -187,21 +206,27 @@ export default function BattleCanvas({ dominance, latestPnL, allianceLiquidity, 
       if (!ctx) return;
       
       // Smoothly interpolate dominance
-      // LERP factor 0.02 for smoother, less jittery transition
       const targetDom = dominanceRef.current;
       const currentDom = currentDominanceRef.current;
       const diff = targetDom - currentDom;
       
       if (Math.abs(diff) > 0.0001) {
-          currentDominanceRef.current += diff * 0.02;
+          currentDominanceRef.current += diff * 0.12;
       } else {
           currentDominanceRef.current = targetDom;
       }
 
+      // Decay impulse/wave effects so each settlement creates a clear kick then cools down.
+      impactRef.current *= 0.9;
+      waveBoostRef.current *= 0.92;
+      if (Math.abs(impactRef.current) < 0.002) impactRef.current = 0;
+      if (waveBoostRef.current < 0.01) waveBoostRef.current = 0;
+
       ctx.clearRect(0, 0, width, height);
       
-      const centerOffset = (width * 0.4) * currentDominanceRef.current;
-      const centerX = width / 2 + centerOffset;
+      const centerOffset = (width * 0.44) * currentDominanceRef.current;
+      const shockOffset = impactRef.current * width * 0.2;
+      const centerX = Math.max(width * 0.1, Math.min(width * 0.9, width / 2 + centerOffset + shockOffset));
 
       // Calculate intensity based on liquidity
       const maxLiq = 5000000;
@@ -276,7 +301,7 @@ export default function BattleCanvas({ dominance, latestPnL, allianceLiquidity, 
 
         const gradient = ctx.createLinearGradient(0, y, width, y);
         
-        const centerRatio = centerX / width;
+        const centerRatio = Math.max(0, Math.min(1, centerX / width));
         const softZone = 0.05; // 5% width transition
 
         // Helper to get color string with alpha
@@ -311,12 +336,13 @@ export default function BattleCanvas({ dominance, latestPnL, allianceLiquidity, 
       ctx.beginPath();
       // Use time for flowing animation
       const flowOffset = Date.now() * 0.005;
+      const waveAmp = 10 + waveBoostRef.current * 26;
+      const distortionAmp = 20 + waveBoostRef.current * 42;
       
       for (let i = 0; i <= height; i += 5) {
-         // Persistent organic wave + dominance distortion
-         // The reference image shows a consistent wavy line.
-         const wave = Math.sin(i * 0.02 - flowOffset) * 10;
-         const distortion = Math.sin(i * 0.01) * 20 * currentDominanceRef.current;
+         // Persistent organic wave + settlement boost distortion.
+         const wave = Math.sin(i * 0.02 - flowOffset) * waveAmp;
+         const distortion = Math.sin(i * 0.01) * distortionAmp * currentDominanceRef.current;
          
          const x = centerX + wave + distortion;
          if (i === 0) ctx.moveTo(x, i);
@@ -328,24 +354,24 @@ export default function BattleCanvas({ dominance, latestPnL, allianceLiquidity, 
       ctx.lineJoin = 'round';
 
       // Layer 1: Wide Outer Glow (Atmosphere)
-      ctx.shadowBlur = 30;
+      ctx.shadowBlur = 30 + waveBoostRef.current * 22;
       ctx.shadowColor = `rgba(${baseColor}, 0.4)`;
       ctx.strokeStyle = `rgba(${baseColor}, 0.1)`;
-      ctx.lineWidth = 20;
+      ctx.lineWidth = 20 + waveBoostRef.current * 12;
       ctx.stroke();
 
       // Layer 2: Medium Glow (Halo)
-      ctx.shadowBlur = 15;
+      ctx.shadowBlur = 15 + waveBoostRef.current * 10;
       ctx.shadowColor = `rgba(${baseColor}, 0.6)`;
       ctx.strokeStyle = `rgba(${baseColor}, 0.4)`;
-      ctx.lineWidth = 8;
+      ctx.lineWidth = 8 + waveBoostRef.current * 4;
       ctx.stroke();
 
       // Layer 3: Core (Bright Center)
-      ctx.shadowBlur = 5;
+      ctx.shadowBlur = 5 + waveBoostRef.current * 5;
       ctx.shadowColor = `rgba(${baseColor}, 1)`;
       ctx.strokeStyle = `rgba(${baseColor}, 1)`; // Match base color for core
-      ctx.lineWidth = 3;
+      ctx.lineWidth = 3 + waveBoostRef.current * 2;
       ctx.stroke();
       
       // Reset

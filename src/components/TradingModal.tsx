@@ -17,8 +17,8 @@ interface TradingModalProps {
   currentPrice: number;
   userBalance: number;
   isTxPending: boolean;
-  onConfirm: (margin: number, leverage: number) => void | Promise<void>;
-  onPreview: (margin: number, leverage: number) => Promise<OpenPreview | null>;
+  onConfirm: (marginInput: string, leverage: number) => void | Promise<void>;
+  onPreview: (marginInput: string, leverage: number) => Promise<OpenPreview | null>;
 }
 
 export default function TradingModal({
@@ -31,21 +31,25 @@ export default function TradingModal({
   onConfirm,
   onPreview
 }: TradingModalProps) {
-  const [margin, setMargin] = useState<number>(1000);
+  const [marginInput, setMarginInput] = useState<string>('1000');
   const [leverage, setLeverage] = useState<number>(10);
   const [preview, setPreview] = useState<OpenPreview | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(false);
+  const [inputError, setInputError] = useState<string | null>(null);
+
+  const margin = Number(marginInput);
+  const marginValid = Number.isFinite(margin) && margin > 0;
 
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
     const timer = window.setTimeout(async () => {
-      if (margin <= 0 || leverage <= 0) {
+      if (!marginValid || leverage <= 0) {
         setPreview(null);
         return;
       }
       setLoadingPreview(true);
-      const result = await onPreview(margin, leverage);
+      const result = await onPreview(marginInput, leverage);
       if (!cancelled) {
         setPreview(result);
         setLoadingPreview(false);
@@ -56,19 +60,21 @@ export default function TradingModal({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [isOpen, margin, leverage, onPreview]);
+  }, [isOpen, marginInput, marginValid, leverage, onPreview]);
 
   useEffect(() => {
     if (!isOpen) {
       setPreview(null);
       setLoadingPreview(false);
+      setInputError(null);
     }
   }, [isOpen]);
 
   if (!isOpen) return null;
 
-  const positionSize = margin * leverage;
-  const fallbackOpenFee = margin * 0.005;
+  const safeMargin = marginValid ? margin : 0;
+  const positionSize = safeMargin * leverage;
+  const fallbackOpenFee = safeMargin * 0.005;
   const openFee = preview?.openFee ?? fallbackOpenFee;
   const congestionFee = preview?.congestionFee ?? 0;
   const congestionToOpposite = preview?.congestionToOpposite ?? 0;
@@ -77,9 +83,19 @@ export default function TradingModal({
   const totalRequired = preview?.totalRequired ?? (margin + openFee + congestionFee);
   const exceedsBalance = totalRequired > userBalance;
 
+  const updateMarginInput = (value: string) => {
+    const normalized = value.replace(',', '.');
+    if (!/^\d*(\.\d{0,18})?$/.test(normalized)) {
+      setInputError('Use up to 18 decimals');
+      return;
+    }
+    setInputError(null);
+    setMarginInput(normalized);
+  };
+
   const handleConfirm = () => {
-    if (margin <= 0 || exceedsBalance || isTxPending) return;
-    void onConfirm(margin, leverage);
+    if (!marginValid || exceedsBalance || isTxPending || inputError) return;
+    void onConfirm(marginInput, leverage);
   };
 
   return (
@@ -119,8 +135,8 @@ export default function TradingModal({
             <div className="relative group">
               <input
                 type="number"
-                value={margin}
-                onChange={(e) => setMargin(Number(e.target.value))}
+                value={marginInput}
+                onChange={(e) => updateMarginInput(e.target.value)}
                 className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-white font-mono focus:outline-none focus:border-neon-blue/50 transition-all"
               />
               <div className="absolute right-4 top-1/2 -translate-y-1/2 text-[10px] font-bold text-zinc-500">$MON</div>
@@ -129,13 +145,14 @@ export default function TradingModal({
               {[25, 50, 75, 100].map(pct => (
                 <button
                   key={pct}
-                  onClick={() => setMargin(Math.floor(userBalance * (pct / 100)))}
+                  onClick={() => updateMarginInput(Math.floor(userBalance * (pct / 100)).toString())}
                   className="flex-1 py-1 bg-white/5 hover:bg-white/10 border border-white/5 rounded-md text-[9px] font-bold text-zinc-400 hover:text-white transition-all"
                 >
                   {pct}%
                 </button>
               ))}
             </div>
+            {inputError && <div className="text-[9px] text-crimson-red font-mono">{inputError}</div>}
           </div>
 
           <div className="space-y-4">
@@ -211,9 +228,9 @@ export default function TradingModal({
         <div className="px-6 py-5 bg-white/5 border-t border-white/5">
           <button
             onClick={handleConfirm}
-            disabled={loadingPreview || exceedsBalance || margin <= 0 || isTxPending}
+            disabled={loadingPreview || exceedsBalance || !marginValid || isTxPending || Boolean(inputError)}
             className={`w-full py-4 rounded-xl font-black uppercase tracking-[0.2em] transition-all duration-300 border-2 ${
-              loadingPreview || exceedsBalance || isTxPending
+              loadingPreview || exceedsBalance || isTxPending || !marginValid || inputError
                 ? 'bg-zinc-800 text-zinc-500 border-transparent cursor-not-allowed'
                 : side === 'long'
                   ? 'bg-neon-green text-black border-neon-green shadow-[0_0_30px_rgba(57,255,20,0.3)] hover:shadow-[0_0_50px_rgba(57,255,20,0.5)]'
