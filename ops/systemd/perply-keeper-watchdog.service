@@ -1,0 +1,16 @@
+[Unit]
+Description=Perply Keeper Watchdog (Cloud)
+After=network-online.target perply-keeper.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=perply
+Group=perply
+WorkingDirectory=/opt/perply
+EnvironmentFile=/etc/perply/keeper.env
+ExecStart=/usr/bin/env bash -lc '${WATCHDOG_CMD}'
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true

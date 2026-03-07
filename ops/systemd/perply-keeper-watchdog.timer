@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Perply Keeper Watchdog every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=perply-keeper-watchdog.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

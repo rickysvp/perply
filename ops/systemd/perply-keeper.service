@@ -1,0 +1,24 @@
+[Unit]
+Description=Perply Keeper (Cloud)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=perply
+Group=perply
+WorkingDirectory=/opt/perply
+EnvironmentFile=/etc/perply/keeper.env
+ExecStart=/usr/bin/env bash -lc '${KEEPER_START_CMD}'
+Restart=always
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
