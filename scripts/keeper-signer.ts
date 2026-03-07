@@ -236,11 +236,15 @@ async function main() {
   const arenaAddress = envRequiredAddress("PERPLY_ARENA_ADDRESS");
   const keeperPk = envRequired("KEEPER_PRIVATE_KEY");
   const priceSignerPk = envRequired("PRICE_SIGNER_PRIVATE_KEY");
+  const nextPriceSignerPk = (process.env.PRICE_SIGNER_PRIVATE_KEY_NEXT || "").trim();
+  const signerPks = Array.from(new Set([priceSignerPk, nextPriceSignerPk].filter((v) => v.length > 0)));
   const pollMs = Number(process.env.KEEPER_POLL_MS || 5_000);
   const minSources = Number(process.env.KEEPER_MIN_PRICE_SOURCES || 2);
   const maxDeviationPct = Number(process.env.KEEPER_MAX_DEVIATION_PCT || 10);
   const expectedChainId = BigInt(process.env.KEEPER_CHAIN_ID || 10143);
   const dryRun = (process.env.KEEPER_DRY_RUN || "").toLowerCase() === "true";
+  const allowSharedSigner = (process.env.KEEPER_ALLOW_SHARED_SIGNER || "").toLowerCase() === "true";
+  const allowSharedSignerUntil = Number(process.env.KEEPER_ALLOW_SHARED_SIGNER_UNTIL || 0);
   const rpcUrls = parseRpcUrls();
 
   if (!Number.isFinite(pollMs) || pollMs < 2_000) {
@@ -255,8 +259,14 @@ async function main() {
   if (expectedChainId <= 0n) {
     throw new Error("KEEPER_CHAIN_ID must be a positive integer");
   }
-  if (keeperPk === priceSignerPk) {
-    throw new Error("KEEPER_PRIVATE_KEY and PRICE_SIGNER_PRIVATE_KEY must be different");
+  if (allowSharedSigner && (!Number.isFinite(allowSharedSignerUntil) || allowSharedSignerUntil <= 0)) {
+    throw new Error("KEEPER_ALLOW_SHARED_SIGNER=true requires KEEPER_ALLOW_SHARED_SIGNER_UNTIL (unix seconds)");
+  }
+  if (allowSharedSigner && Math.floor(Date.now() / 1000) > allowSharedSignerUntil) {
+    throw new Error("KEEPER_ALLOW_SHARED_SIGNER window has expired");
+  }
+  if (!allowSharedSigner && signerPks.some((pk) => pk === keeperPk)) {
+    throw new Error("KEEPER_PRIVATE_KEY must be different from all configured signer keys");
   }
 
   let running = false;
@@ -268,8 +278,8 @@ async function main() {
     try {
       const provider = await getHealthyProvider(rpcUrls);
       const keeperWallet = new ethers.Wallet(keeperPk, provider);
-      const signerWallet = new ethers.Wallet(priceSignerPk);
-      if (keeperWallet.address.toLowerCase() === signerWallet.address.toLowerCase()) {
+      const signerWallets = signerPks.map((pk) => new ethers.Wallet(pk));
+      if (!allowSharedSigner && signerWallets.some((wallet) => wallet.address.toLowerCase() === keeperWallet.address.toLowerCase())) {
         throw new Error("keeper and price signer addresses must be different");
       }
       const keeperContract = new ethers.Contract(arenaAddress, ARENA_ABI, keeperWallet);
@@ -302,8 +312,11 @@ async function main() {
         return;
       }
 
-      if (configuredSigner.toLowerCase() !== signerWallet.address.toLowerCase()) {
-        console.log("[keeper] skip: PRICE_SIGNER_PRIVATE_KEY does not match contract priceSigner");
+      const signerWallet = signerWallets.find((wallet) => wallet.address.toLowerCase() === configuredSigner.toLowerCase());
+      if (!signerWallet) {
+        const configured = configuredSigner.toLowerCase();
+        const candidates = signerWallets.map((wallet) => wallet.address.toLowerCase()).join(",");
+        console.log(`[keeper] skip: configured priceSigner ${configured} not in local signer keys [${candidates}]`);
         return;
       }
 
@@ -314,7 +327,8 @@ async function main() {
 
       const currentMark = Number(markPriceE8) / 1e8;
       const deltaPct = currentMark > 0 ? Math.abs(market.price - currentMark) / currentMark * 100 : 0;
-      const nowSec = Math.floor(Date.now() / 1000);
+      const latestBlock = await provider.getBlock("latest");
+      const nowSec = latestBlock?.timestamp ? Number(latestBlock.timestamp) : Math.floor(Date.now() / 1000);
       const elapsed = nowSec - lastSettlementAt;
       if (nowSec <= lastSettlementAt) {
         console.log(`[keeper] skip: local clock is not ahead of last settlement (${nowSec} <= ${lastSettlementAt})`);
@@ -373,7 +387,9 @@ async function main() {
     }
   };
 
-  console.log(`[keeper] start: arena=${arenaAddress} poll=${pollMs}ms dryRun=${dryRun} rpc=${rpcUrls.join(",")}`);
+  console.log(
+    `[keeper] start: arena=${arenaAddress} poll=${pollMs}ms dryRun=${dryRun} allowSharedSigner=${allowSharedSigner} sharedUntil=${allowSharedSignerUntil || 0} rpc=${rpcUrls.join(",")}`
+  );
   await tick();
   const timer = setInterval(() => {
     void tick();

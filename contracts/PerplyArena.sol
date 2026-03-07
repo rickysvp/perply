@@ -65,7 +65,14 @@ contract PerplyArena {
         bool queued;
     }
 
+    struct TimelockedUint32Operation {
+        uint32 value;
+        uint256 eta;
+        bool queued;
+    }
+
     address public owner;
+    address public emergencyGuardian;
     address public keeper;
     address public priceSigner;
 
@@ -112,13 +119,18 @@ contract PerplyArena {
     int256[2] public accPnlPerWeight;
     uint256[2] public cumulativeCongestionRewards;
     QueuedRiskParams private queuedRiskParams;
+    TimelockedAddressOperation private queuedOwnershipTransfer;
     TimelockedAddressOperation private queuedKeeperUpdate;
     TimelockedAddressOperation private queuedPriceSignerUpdate;
     TimelockedBoolOperation private queuedDirectSettlementToggle;
+    TimelockedBoolOperation private queuedPauseDisable;
+    TimelockedBoolOperation private queuedReduceOnlyDisable;
+    TimelockedUint32Operation private queuedMaxPriceAgeUpdate;
     TimelockedWithdrawalOperation private queuedTreasuryWithdrawal;
     TimelockedWithdrawalOperation private queuedInsuranceWithdrawal;
 
     error OnlyOwner();
+    error UnauthorizedEmergencyManager();
     error UnauthorizedKeeper();
     error InvalidSide();
     error InvalidAmount();
@@ -147,9 +159,14 @@ contract PerplyArena {
     error SystemInsolvent();
 
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    event EmergencyGuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
+    event OwnershipTransferQueued(address indexed newOwner, uint256 executeAfter);
+    event OwnershipTransferCancelled(address indexed queuedOwner);
     event KeeperUpdated(address indexed newKeeper);
     event PriceSignerUpdated(address indexed oldSigner, address indexed newSigner);
     event PriceAgeUpdated(uint32 maxPriceAgeSec);
+    event PriceAgeUpdateQueued(uint32 newMaxPriceAgeSec, uint256 executeAfter);
+    event PriceAgeUpdateCancelled(uint32 queuedMaxPriceAgeSec);
     event MarkPriceUpdated(uint256 oldPriceE8, uint256 newPriceE8);
     event ParamsUpdated();
     event RiskParamsQueued(bytes32 indexed paramsHash, uint256 executeAfter);
@@ -157,7 +174,11 @@ contract PerplyArena {
     event RiskParamsTimelockUpdated(uint32 newDelaySec);
     event AdminOpsTimelockUpdated(uint32 newDelaySec);
     event PauseUpdated(bool paused);
+    event PauseDisableQueued(uint256 executeAfter);
+    event PauseDisableCancelled();
     event ReduceOnlyUpdated(bool reduceOnly);
+    event ReduceOnlyDisableQueued(uint256 executeAfter);
+    event ReduceOnlyDisableCancelled();
     event DirectSettlementToggled(bool enabled);
     event KeeperUpdateQueued(address indexed newKeeper, uint256 executeAfter);
     event KeeperUpdateCancelled(address indexed queuedKeeper);
@@ -246,6 +267,7 @@ contract PerplyArena {
         if (initialPriceE8 > type(uint64).max) revert PriceOutOfRange();
 
         owner = msg.sender;
+        emergencyGuardian = msg.sender;
         keeper = msg.sender;
         priceSigner = msg.sender;
 
@@ -281,9 +303,29 @@ contract PerplyArena {
 
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert InvalidAddress();
+        if (queuedOwnershipTransfer.queued) revert AdminOperationAlreadyQueued();
+        queuedOwnershipTransfer = TimelockedAddressOperation({
+            value: newOwner,
+            eta: block.timestamp + adminOpsTimelockSec,
+            queued: true
+        });
+        emit OwnershipTransferQueued(newOwner, queuedOwnershipTransfer.eta);
+    }
+
+    function executeOwnershipTransfer() external onlyOwner {
+        if (!queuedOwnershipTransfer.queued) revert NoAdminOperationQueued();
+        if (block.timestamp < queuedOwnershipTransfer.eta) revert AdminOperationTimelockPending();
         address oldOwner = owner;
-        owner = newOwner;
-        emit OwnershipTransferred(oldOwner, newOwner);
+        owner = queuedOwnershipTransfer.value;
+        delete queuedOwnershipTransfer;
+        emit OwnershipTransferred(oldOwner, owner);
+    }
+
+    function cancelOwnershipTransfer() external onlyOwner {
+        if (!queuedOwnershipTransfer.queued) revert NoAdminOperationQueued();
+        address queued = queuedOwnershipTransfer.value;
+        delete queuedOwnershipTransfer;
+        emit OwnershipTransferCancelled(queued);
     }
 
     function setKeeper(address newKeeper) external onlyOwner {
@@ -295,6 +337,13 @@ contract PerplyArena {
             queued: true
         });
         emit KeeperUpdateQueued(newKeeper, queuedKeeperUpdate.eta);
+    }
+
+    function setEmergencyGuardian(address newGuardian) external onlyOwner {
+        if (newGuardian == address(0)) revert InvalidAddress();
+        address oldGuardian = emergencyGuardian;
+        emergencyGuardian = newGuardian;
+        emit EmergencyGuardianUpdated(oldGuardian, newGuardian);
     }
 
     function executeKeeperUpdate() external onlyOwner {
@@ -341,8 +390,29 @@ contract PerplyArena {
 
     function setMaxPriceAgeSec(uint32 newMaxPriceAgeSec) external onlyOwner {
         if (newMaxPriceAgeSec == 0 || newMaxPriceAgeSec > 900) revert InvalidAmount();
-        maxPriceAgeSec = newMaxPriceAgeSec;
-        emit PriceAgeUpdated(newMaxPriceAgeSec);
+        if (queuedMaxPriceAgeUpdate.queued) revert AdminOperationAlreadyQueued();
+        queuedMaxPriceAgeUpdate = TimelockedUint32Operation({
+            value: newMaxPriceAgeSec,
+            eta: block.timestamp + adminOpsTimelockSec,
+            queued: true
+        });
+        emit PriceAgeUpdateQueued(newMaxPriceAgeSec, queuedMaxPriceAgeUpdate.eta);
+    }
+
+    function executeMaxPriceAgeSecUpdate() external onlyOwner {
+        if (!queuedMaxPriceAgeUpdate.queued) revert NoAdminOperationQueued();
+        if (block.timestamp < queuedMaxPriceAgeUpdate.eta) revert AdminOperationTimelockPending();
+        maxPriceAgeSec = queuedMaxPriceAgeUpdate.value;
+        uint32 value = queuedMaxPriceAgeUpdate.value;
+        delete queuedMaxPriceAgeUpdate;
+        emit PriceAgeUpdated(value);
+    }
+
+    function cancelMaxPriceAgeSecUpdate() external onlyOwner {
+        if (!queuedMaxPriceAgeUpdate.queued) revert NoAdminOperationQueued();
+        uint32 value = queuedMaxPriceAgeUpdate.value;
+        delete queuedMaxPriceAgeUpdate;
+        emit PriceAgeUpdateCancelled(value);
     }
 
     function setRiskParamsTimelockSec(uint32 newDelaySec) external onlyOwner {
@@ -357,14 +427,74 @@ contract PerplyArena {
         emit AdminOpsTimelockUpdated(newDelaySec);
     }
 
-    function setPaused(bool newPaused) external onlyOwner {
-        paused = newPaused;
-        emit PauseUpdated(newPaused);
+    function setPaused(bool newPaused) external {
+        if (newPaused) {
+            if (msg.sender != owner && msg.sender != emergencyGuardian) revert UnauthorizedEmergencyManager();
+            if (!paused) {
+                paused = true;
+                emit PauseUpdated(true);
+            }
+            return;
+        }
+
+        if (msg.sender != owner) revert OnlyOwner();
+        if (!paused) return;
+        if (queuedPauseDisable.queued) revert AdminOperationAlreadyQueued();
+        queuedPauseDisable = TimelockedBoolOperation({
+            value: false,
+            eta: block.timestamp + adminOpsTimelockSec,
+            queued: true
+        });
+        emit PauseDisableQueued(queuedPauseDisable.eta);
     }
 
-    function setReduceOnly(bool newReduceOnly) external onlyOwner {
-        reduceOnly = newReduceOnly;
-        emit ReduceOnlyUpdated(newReduceOnly);
+    function executePauseDisable() external onlyOwner {
+        if (!queuedPauseDisable.queued) revert NoAdminOperationQueued();
+        if (block.timestamp < queuedPauseDisable.eta) revert AdminOperationTimelockPending();
+        paused = false;
+        delete queuedPauseDisable;
+        emit PauseUpdated(false);
+    }
+
+    function cancelPauseDisable() external onlyOwner {
+        if (!queuedPauseDisable.queued) revert NoAdminOperationQueued();
+        delete queuedPauseDisable;
+        emit PauseDisableCancelled();
+    }
+
+    function setReduceOnly(bool newReduceOnly) external {
+        if (newReduceOnly) {
+            if (msg.sender != owner && msg.sender != emergencyGuardian) revert UnauthorizedEmergencyManager();
+            if (!reduceOnly) {
+                reduceOnly = true;
+                emit ReduceOnlyUpdated(true);
+            }
+            return;
+        }
+
+        if (msg.sender != owner) revert OnlyOwner();
+        if (!reduceOnly) return;
+        if (queuedReduceOnlyDisable.queued) revert AdminOperationAlreadyQueued();
+        queuedReduceOnlyDisable = TimelockedBoolOperation({
+            value: false,
+            eta: block.timestamp + adminOpsTimelockSec,
+            queued: true
+        });
+        emit ReduceOnlyDisableQueued(queuedReduceOnlyDisable.eta);
+    }
+
+    function executeReduceOnlyDisable() external onlyOwner {
+        if (!queuedReduceOnlyDisable.queued) revert NoAdminOperationQueued();
+        if (block.timestamp < queuedReduceOnlyDisable.eta) revert AdminOperationTimelockPending();
+        reduceOnly = false;
+        delete queuedReduceOnlyDisable;
+        emit ReduceOnlyUpdated(false);
+    }
+
+    function cancelReduceOnlyDisable() external onlyOwner {
+        if (!queuedReduceOnlyDisable.queued) revert NoAdminOperationQueued();
+        delete queuedReduceOnlyDisable;
+        emit ReduceOnlyDisableCancelled();
     }
 
     function setDirectSettlementEnabled(bool enabled) external onlyOwner {
@@ -838,6 +968,12 @@ contract PerplyArena {
         queued = queuedKeeperUpdate.queued;
     }
 
+    function getQueuedOwnershipTransfer() external view returns (address value, uint256 eta, bool queued) {
+        value = queuedOwnershipTransfer.value;
+        eta = queuedOwnershipTransfer.eta;
+        queued = queuedOwnershipTransfer.queued;
+    }
+
     function getQueuedPriceSignerUpdate() external view returns (address value, uint256 eta, bool queued) {
         value = queuedPriceSignerUpdate.value;
         eta = queuedPriceSignerUpdate.eta;
@@ -848,6 +984,24 @@ contract PerplyArena {
         value = queuedDirectSettlementToggle.value;
         eta = queuedDirectSettlementToggle.eta;
         queued = queuedDirectSettlementToggle.queued;
+    }
+
+    function getQueuedPauseDisable() external view returns (bool value, uint256 eta, bool queued) {
+        value = queuedPauseDisable.value;
+        eta = queuedPauseDisable.eta;
+        queued = queuedPauseDisable.queued;
+    }
+
+    function getQueuedReduceOnlyDisable() external view returns (bool value, uint256 eta, bool queued) {
+        value = queuedReduceOnlyDisable.value;
+        eta = queuedReduceOnlyDisable.eta;
+        queued = queuedReduceOnlyDisable.queued;
+    }
+
+    function getQueuedMaxPriceAgeUpdate() external view returns (uint32 value, uint256 eta, bool queued) {
+        value = queuedMaxPriceAgeUpdate.value;
+        eta = queuedMaxPriceAgeUpdate.eta;
+        queued = queuedMaxPriceAgeUpdate.queued;
     }
 
     function getQueuedTreasuryWithdrawal()

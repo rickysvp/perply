@@ -50,6 +50,19 @@ read_bool() {
   cast call "${PERPLY_ARENA_ADDRESS}" "${fn_sig}" --rpc-url "${MONAD_RPC_URL}" | tr '[:upper:]' '[:lower:]'
 }
 
+read_queue_eta_if_queued() {
+  local fn_sig="$1"
+  local out eta queued
+  out="$(cast call "${PERPLY_ARENA_ADDRESS}" "${fn_sig}" --rpc-url "${MONAD_RPC_URL}")"
+  eta="$(echo "$out" | sed -n '2p' | awk '{print $1}')"
+  queued="$(echo "$out" | sed -n '3p')"
+  if [[ "$queued" == "true" ]]; then
+    echo "$eta"
+  else
+    echo ""
+  fi
+}
+
 ensure_contract_code() {
   local code
   code="$(cast code "${PERPLY_ARENA_ADDRESS}" --rpc-url "${MONAD_RPC_URL}")"
@@ -94,10 +107,20 @@ if [[ "${EXECUTE}" != "true" ]]; then
   echo "  1) setPaused(true)"
   echo "  2) setReduceOnly(true)"
   echo "  3) verify paused/reduceOnly are true"
-  echo "  4) rollback to initial snapshot:"
-  echo "     - setReduceOnly(${initial_reduce_only})"
-  echo "     - setPaused(${initial_paused})"
-  echo "  5) verify restored snapshot"
+  echo "  4) rollback plan:"
+  if [[ "${initial_reduce_only}" == "false" ]]; then
+    echo "     - setReduceOnly(false)  # queues timelocked disable"
+    echo "     - executeReduceOnlyDisable() after timelock"
+  else
+    echo "     - keep reduceOnly=true"
+  fi
+  if [[ "${initial_paused}" == "false" ]]; then
+    echo "     - setPaused(false)      # queues timelocked disable"
+    echo "     - executePauseDisable() after timelock"
+  else
+    echo "     - keep paused=true"
+  fi
+  echo "  5) verify restored snapshot (after disable executes)"
   echo
   echo "To execute drill:"
   echo "  EXECUTE=true DRILL_CONFIRM=YES DEPLOYER_PRIVATE_KEY=0x... PERPLY_ARENA_ADDRESS=${PERPLY_ARENA_ADDRESS} bash scripts/drill-emergency-controls.sh"
@@ -126,6 +149,25 @@ send_tx "setPaused(bool)" "${initial_paused}"
 
 final_paused="$(read_bool 'paused()(bool)')"
 final_reduce_only="$(read_bool 'reduceOnly()(bool)')"
+
+reduce_eta=""
+pause_eta=""
+if [[ "${initial_reduce_only}" == "false" && "${final_reduce_only}" == "true" ]]; then
+  reduce_eta="$(read_queue_eta_if_queued 'getQueuedReduceOnlyDisable()(bool,uint256,bool)')"
+fi
+if [[ "${initial_paused}" == "false" && "${final_paused}" == "true" ]]; then
+  pause_eta="$(read_queue_eta_if_queued 'getQueuedPauseDisable()(bool,uint256,bool)')"
+fi
+
+if [[ -n "${reduce_eta}" || -n "${pause_eta}" ]]; then
+  echo
+  echo "Drill partial rollback complete: disable actions are timelocked."
+  [[ -n "${reduce_eta}" ]] && echo "  reduceOnly disable queued, eta=${reduce_eta}"
+  [[ -n "${pause_eta}" ]] && echo "  pause disable queued, eta=${pause_eta}"
+  echo "Run timelock executor after ETA:"
+  echo "  npm run ops:timelock:run"
+  exit 0
+fi
 
 if [[ "${final_paused}" != "${initial_paused}" || "${final_reduce_only}" != "${initial_reduce_only}" ]]; then
   echo "Rollback failed."

@@ -1,7 +1,7 @@
 {
-  "name": "react-example",
+  "name": "perply",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -15,7 +15,15 @@
     "contract:smoke-fees:monad": "bash scripts/smoke-check-fees-monad.sh",
     "preflight:security": "bash scripts/preflight-security.sh",
     "drill:emergency": "bash scripts/drill-emergency-controls.sh",
-    "keeper:run": "tsx scripts/keeper-signer.ts"
+    "keeper:run": "tsx scripts/keeper-signer.ts",
+    "ops:keeper:start": "bash scripts/ops/keeper-service.sh start",
+    "ops:keeper:stop": "bash scripts/ops/keeper-service.sh stop",
+    "ops:keeper:restart": "bash scripts/ops/keeper-service.sh restart",
+    "ops:keeper:status": "bash scripts/ops/keeper-service.sh status",
+    "ops:keeper:logs": "bash scripts/ops/keeper-service.sh logs",
+    "ops:timelock:run": "bash scripts/ops/timelock-executor.sh",
+    "ops:watchdog:run": "bash scripts/ops/health-watchdog.sh",
+    "ops:cron:print": "bash scripts/ops/print-crontab.sh"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

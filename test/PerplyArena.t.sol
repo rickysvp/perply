@@ -238,6 +238,29 @@ contract PerplyArenaTest is Test {
         assertFalse(arena.getPosition(alice, LONG).isOpen, "close should still work in paused mode");
     }
 
+    function testPauseDisableIsTimelocked() public {
+        arena.setPaused(true);
+        arena.setPaused(false);
+        vm.expectRevert(PerplyArena.AdminOperationTimelockPending.selector);
+        arena.executePauseDisable();
+
+        vm.warp(block.timestamp + arena.adminOpsTimelockSec());
+        arena.executePauseDisable();
+        assertFalse(arena.paused(), "pause disable should execute after timelock");
+    }
+
+    function testEmergencyGuardianCanActivatePause() public {
+        address guardian = makeAddr("guardian");
+        arena.setEmergencyGuardian(guardian);
+        vm.prank(guardian);
+        arena.setPaused(true);
+        assertTrue(arena.paused(), "guardian should be able to activate pause");
+
+        vm.prank(guardian);
+        vm.expectRevert(PerplyArena.OnlyOwner.selector);
+        arena.setPaused(false);
+    }
+
     function testReduceOnlyBlocksOpenButAllowsClose() public {
         _deposit(alice, 10 ether);
         _open(alice, LONG, 1 ether, 10);
@@ -251,6 +274,29 @@ contract PerplyArenaTest is Test {
 
         _close(alice, LONG);
         assertFalse(arena.getPosition(alice, LONG).isOpen, "close should still work in reduce-only mode");
+    }
+
+    function testReduceOnlyDisableIsTimelocked() public {
+        arena.setReduceOnly(true);
+        arena.setReduceOnly(false);
+        vm.expectRevert(PerplyArena.AdminOperationTimelockPending.selector);
+        arena.executeReduceOnlyDisable();
+
+        vm.warp(block.timestamp + arena.adminOpsTimelockSec());
+        arena.executeReduceOnlyDisable();
+        assertFalse(arena.reduceOnly(), "reduce-only disable should execute after timelock");
+    }
+
+    function testEmergencyGuardianCanActivateReduceOnly() public {
+        address guardian = makeAddr("guardian");
+        arena.setEmergencyGuardian(guardian);
+        vm.prank(guardian);
+        arena.setReduceOnly(true);
+        assertTrue(arena.reduceOnly(), "guardian should be able to activate reduce-only");
+
+        vm.prank(guardian);
+        vm.expectRevert(PerplyArena.OnlyOwner.selector);
+        arena.setReduceOnly(false);
     }
 
     function testRiskParamsTimelockQueueAndExecute() public {
@@ -353,6 +399,24 @@ contract PerplyArenaTest is Test {
         assertEq(arena.keeper(), newKeeper, "keeper update should execute after timelock");
     }
 
+    function testOwnershipTransferIsTimelocked() public {
+        address newOwner = makeAddr("newOwner");
+        arena.transferOwnership(newOwner);
+
+        vm.expectRevert(PerplyArena.AdminOperationTimelockPending.selector);
+        arena.executeOwnershipTransfer();
+
+        vm.warp(block.timestamp + arena.adminOpsTimelockSec());
+        arena.executeOwnershipTransfer();
+        assertEq(arena.owner(), newOwner, "ownership transfer should execute after timelock");
+    }
+
+    function testOwnershipTransferCannotOverwritePendingQueue() public {
+        arena.transferOwnership(makeAddr("ownerOne"));
+        vm.expectRevert(PerplyArena.AdminOperationAlreadyQueued.selector);
+        arena.transferOwnership(makeAddr("ownerTwo"));
+    }
+
     function testKeeperUpdateCannotOverwritePendingQueue() public {
         arena.setKeeper(makeAddr("keeperOne"));
         vm.expectRevert(PerplyArena.AdminOperationAlreadyQueued.selector);
@@ -379,6 +443,23 @@ contract PerplyArenaTest is Test {
         arena.setDirectSettlementEnabled(true);
         vm.expectRevert(PerplyArena.AdminOperationAlreadyQueued.selector);
         arena.setDirectSettlementEnabled(false);
+    }
+
+    function testMaxPriceAgeUpdateIsTimelocked() public {
+        arena.setMaxPriceAgeSec(120);
+
+        vm.expectRevert(PerplyArena.AdminOperationTimelockPending.selector);
+        arena.executeMaxPriceAgeSecUpdate();
+
+        vm.warp(block.timestamp + arena.adminOpsTimelockSec());
+        arena.executeMaxPriceAgeSecUpdate();
+        assertEq(arena.maxPriceAgeSec(), 120, "max price age update should execute after timelock");
+    }
+
+    function testMaxPriceAgeCannotOverwritePendingQueue() public {
+        arena.setMaxPriceAgeSec(120);
+        vm.expectRevert(PerplyArena.AdminOperationAlreadyQueued.selector);
+        arena.setMaxPriceAgeSec(180);
     }
 
     function testTreasuryWithdrawalIsTimelocked() public {

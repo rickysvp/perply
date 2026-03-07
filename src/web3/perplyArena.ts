@@ -9,11 +9,14 @@ export const MONAD_TESTNET = {
     symbol: 'MON',
     decimals: 18
   },
-  rpcUrls: ['https://testnet-rpc.monad.xyz'],
+  rpcUrls: [
+    'https://testnet-rpc.monad.xyz',
+    'https://rpc.ankr.com/monad_testnet'
+  ],
   blockExplorerUrls: ['https://testnet.monadvision.com']
 } as const;
 
-const DEFAULT_RPC_TIMEOUT_MS = 1800;
+const DEFAULT_RPC_TIMEOUT_MS = 5000;
 let cachedHealthyRpcUrl: string | null = null;
 
 export const PERPLY_ARENA_ABI = [
@@ -23,11 +26,15 @@ export const PERPLY_ARENA_ABI = [
   'function lastSettlementAt() view returns (uint256)',
   'function minSettlementInterval() view returns (uint32)',
   'function volatilityTriggerBps() view returns (uint16)',
+  'function settlementStrengthBps() view returns (uint16)',
+  'function maxSettlementTransferBps() view returns (uint16)',
+  'function settlementFeeBps() view returns (uint16)',
   'function availableBalance(address) view returns (uint256)',
+  'function sideMargin(uint256) view returns (uint256)',
   'function getPosition(address trader, uint8 side) view returns (tuple(uint256 margin, uint256 weight, uint32 leverage, uint64 entryPriceE8, bool isOpen, int256 pnl, int256 equity, uint256 maintenanceMargin))',
   'function getCongestionRatesBps() view returns (uint16 longRate, uint16 shortRate)',
-  'function cumulativeCongestionRewards(uint8 side) view returns (uint256)',
-  'function sideWeight(uint8 side) view returns (uint256)',
+  'function cumulativeCongestionRewards(uint256 side) view returns (uint256)',
+  'function sideWeight(uint256 side) view returns (uint256)',
   'function previewOpen(uint8 side, uint256 margin, uint32 leverage) view returns (uint256 openFee, uint16 congestionRateBps, uint256 congestionFee, uint256 congestionToOpposite, uint256 congestionToTreasury, uint256 totalRequired)',
   'function deposit() payable',
   'function withdraw(uint256 amount)',
@@ -46,6 +53,9 @@ export interface WalletProvider {
   isMetaMask?: boolean;
   isOKExWallet?: boolean;
   isOkxWallet?: boolean;
+  isBinance?: boolean;
+  isBinanceWallet?: boolean;
+  isBinanceChainWallet?: boolean;
   isRabby?: boolean;
   isBackpack?: boolean;
   isPhantom?: boolean;
@@ -109,6 +119,14 @@ function uniqueUrls(urls: string[]): string[] {
   return result;
 }
 
+function prioritizeRpcUrls(urls: string[]): string[] {
+  return [...urls].sort((a, b) => {
+    const aRateLimited = a.includes('testnet-rpc.monad.xyz') ? 1 : 0;
+    const bRateLimited = b.includes('testnet-rpc.monad.xyz') ? 1 : 0;
+    return aRateLimited - bRateLimited;
+  });
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = globalThis.setTimeout(() => reject(new Error(reason)), timeoutMs);
@@ -127,7 +145,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: string):
 export function getMonadRpcUrls(): string[] {
   const customList = parseRpcUrls(import.meta.env.VITE_MONAD_RPC_URLS).filter(isAllowedRpcUrl);
   const single = parseRpcUrls(import.meta.env.VITE_MONAD_RPC_URL).filter(isAllowedRpcUrl);
-  return uniqueUrls([...customList, ...single, ...MONAD_TESTNET.rpcUrls]);
+  return prioritizeRpcUrls(uniqueUrls([...customList, ...single, ...MONAD_TESTNET.rpcUrls]));
 }
 
 export async function probeMonadRpcUrls(timeoutMs = DEFAULT_RPC_TIMEOUT_MS): Promise<RpcHealthProbe[]> {
@@ -191,6 +209,7 @@ function classifyWalletName(provider: WalletProvider, hint?: string): string {
   const text = (hint ?? '').toLowerCase();
   if (provider.isRabby || text.includes('rabby')) return 'Rabby';
   if (provider.isOKExWallet || provider.isOkxWallet || text.includes('okx')) return 'OKX Wallet';
+  if (provider.isBinance || provider.isBinanceWallet || provider.isBinanceChainWallet || text.includes('binance') || text.includes('bnb')) return 'Binance Wallet';
   if (provider.isBackpack || text.includes('backpack')) return 'Backpack';
   if (provider.isPhantom || text.includes('phantom')) return 'Phantom';
   if (provider.isMetaMask || text.includes('metamask')) return 'MetaMask';
@@ -202,8 +221,9 @@ function walletPriority(name: string): number {
   if (normalized.includes('metamask')) return 0;
   if (normalized.includes('okx')) return 1;
   if (normalized.includes('rabby')) return 2;
-  if (normalized.includes('backpack')) return 3;
-  if (normalized.includes('phantom')) return 4;
+  if (normalized.includes('binance')) return 3;
+  if (normalized.includes('backpack')) return 4;
+  if (normalized.includes('phantom')) return 5;
   return 50;
 }
 
@@ -275,6 +295,9 @@ export async function discoverWallets(timeoutMs = 220): Promise<DiscoveredWallet
   const w = window as Window & {
     ethereum?: WalletProvider;
     okxwallet?: { ethereum?: WalletProvider };
+    binancew3w?: { ethereum?: WalletProvider };
+    binance?: { ethereum?: WalletProvider };
+    BinanceChain?: WalletProvider;
     rabby?: { ethereum?: WalletProvider };
     backpack?: { ethereum?: WalletProvider };
     phantom?: { ethereum?: WalletProvider };
@@ -288,6 +311,9 @@ export async function discoverWallets(timeoutMs = 220): Promise<DiscoveredWallet
   }
   addWallet(maybeEthereum);
   addWallet(w.okxwallet?.ethereum, { name: 'OKX Wallet', rdns: 'com.okex.wallet' });
+  addWallet(w.binancew3w?.ethereum, { name: 'Binance Wallet', rdns: 'com.binance.wallet' });
+  addWallet(w.binance?.ethereum, { name: 'Binance Wallet', rdns: 'com.binance.wallet' });
+  addWallet(w.BinanceChain, { name: 'Binance Wallet', rdns: 'com.binance.wallet' });
   addWallet(w.rabby?.ethereum, { name: 'Rabby', rdns: 'io.rabby' });
   addWallet(w.backpack?.ethereum, { name: 'Backpack', rdns: 'io.backpack' });
   addWallet(w.phantom?.ethereum, { name: 'Phantom', rdns: 'app.phantom' });

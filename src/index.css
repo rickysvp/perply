@@ -8,6 +8,11 @@ body {
   @apply bg-cyber-black text-white overflow-hidden font-sans;
 }
 
+.apple-ui-font {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+  letter-spacing: 0;
+}
+
 .cyber-text-gradient {
   background: linear-gradient(to right, #00F0FF, #BC13FE, #FF003C);
   -webkit-background-clip: text;

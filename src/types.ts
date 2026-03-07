@@ -3,7 +3,7 @@ export interface BattleRecord {
   faction: 'left' | 'right';
   amount: string;
   time: string;
-  kind: 'settlement' | 'congestion';
+  kind: 'settlement' | 'congestion' | 'projection';
   label: string;
 }
 
@@ -15,6 +15,11 @@ export interface Position {
   onchainPnl?: number;
   onchainEquity?: number;
   maintenanceMargin?: number;
+  marginWei?: bigint;
+  weightWei?: bigint;
+  onchainPnlWei?: bigint;
+  onchainEquityWei?: bigint;
+  maintenanceMarginWei?: bigint;
 }
 
 export interface UserPositions {

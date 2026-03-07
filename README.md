@@ -120,10 +120,49 @@ export KEEPER_MIN_PRICE_SOURCES=2
 export KEEPER_MAX_DEVIATION_PCT=10
 export KEEPER_CHAIN_ID=10143
 export KEEPER_DRY_RUN=false
+# transition only (until timelocked signer update is executed):
+export KEEPER_ALLOW_SHARED_SIGNER=false
+export KEEPER_ALLOW_SHARED_SIGNER_UNTIL=0
 npm run keeper:run
 ```
 
 Security note: `KEEPER_PRIVATE_KEY` and `PRICE_SIGNER_PRIVATE_KEY` must be different keys.
+
+## Secure Automation Ops
+
+Use built-in ops scripts for safer unattended operation:
+
+```bash
+# keeper lifecycle
+npm run ops:keeper:start
+npm run ops:keeper:status
+npm run ops:keeper:logs
+npm run ops:keeper:restart
+npm run ops:keeper:stop
+
+# execute due timelock ops (idempotent)
+npm run ops:timelock:run
+
+# watchdog (single check by default)
+npm run ops:watchdog:run
+```
+
+Ops scripts read `.env` and `.env.local` and write runtime state/logs into `.ops/`.
+
+Print recommended cron entries:
+
+```bash
+npm run ops:cron:print
+```
+
+Recommended production policy:
+
+1. Keep `owner`, `keeper`, and `priceSigner` on different keys.
+2. Enable `KEEPER_ALLOW_SHARED_SIGNER=true` only as a short transition fallback.
+3. Run timelock executor and watchdog from cron/systemd with persistent logs.
+4. Rotate keys immediately if ever exposed.
+5. Do not run owner and keeper with the same key. Ops scripts block this by default (`ALLOW_NONCE_CONFLICT=false`).
+6. Keep `AUTO_EXECUTE_OWNERSHIP_TRANSFER=false` unless you intentionally want unattended ownership handover.
 
 Run full security preflight before release:
 
@@ -168,8 +207,9 @@ npm run drill:emergency
 1. Direct `settleWithPrice` is disabled by default.
 2. Production keeper should call `settleWithSignedPrice` with an off-chain signer.
 3. `setRiskParams` is timelocked; execute with `executeRiskParams()` after delay.
-4. `paused` and `reduceOnly` switches are available for incident response.
+4. `paused` and `reduceOnly` can be activated immediately for incident response; disabling them is timelocked.
 5. Uncovered loss is tracked as `systemBadDebt`; new opens are blocked until debt is recapitalized.
+6. `transferOwnership` and `setMaxPriceAgeSec` are timelocked admin operations (queue + execute).
 
 ## V1.1 Source Aggregation
 
