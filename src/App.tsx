@@ -31,7 +31,7 @@ import {
 
 const DEFAULT_PRICE = 64289.40;
 const DEFAULT_BALANCE = 0;
-const MIN_DEPOSIT_MON = 10;
+const MIN_DEPOSIT_MON = 9;
 const ONBOARDING_STORAGE_KEY = 'perply_onboarding_hidden_v1';
 const PRICE_HISTORY_POINTS = 40;
 const MARKET_POLL_MS = 1000;
@@ -133,9 +133,6 @@ const ERC20_BALANCE_ABI = [
 
 const SUPPORTED_WALLETS = [
   { key: 'okx', label: 'OKX Wallet', aliases: ['okx'], logo: '/wallets/okx.png', installUrl: 'https://www.okx.com/web3' },
-  { key: 'metamask', label: 'MetaMask', aliases: ['meta', 'metamask'], logo: '/wallets/metamask.svg', installUrl: 'https://metamask.io/download' },
-  { key: 'rabby', label: 'Rabby', aliases: ['rabby'], logo: '/wallets/rabby.png', installUrl: 'https://rabby.io/' },
-  { key: 'binance', label: 'Binance Wallet', aliases: ['binance', 'bnb'], logo: '/wallets/binance.ico', installUrl: 'https://www.binance.com/en/web3wallet' },
   { key: 'backpack', label: 'Backpack', aliases: ['backpack'], logo: '/wallets/backpack.png', installUrl: 'https://backpack.app/' },
   { key: 'phantom', label: 'Phantom', aliases: ['phantom'], logo: '/wallets/phantom.svg', installUrl: 'https://phantom.com/download' }
 ] as const;
@@ -1046,7 +1043,7 @@ export default function App() {
   const connectWallet = async (providerOverride?: WalletProvider, walletNameOverride?: string, walletKey?: string) => {
     const provider = providerOverride ?? walletProvider ?? getEthereumProvider();
     if (!provider) {
-      setWalletError('No EVM wallet detected. Install MetaMask / OKX / Rabby / Binance / Backpack / Phantom');
+      setWalletError('No supported EVM wallet detected. Install OKX / Phantom / Backpack');
       pushNotice('error', 'No wallet provider detected. Install a supported wallet extension first.');
       return;
     }
@@ -1805,13 +1802,14 @@ export default function App() {
             {/* Left: Logo */}
             <div className="flex items-center space-x-2 md:space-x-4">
               <div className="flex items-center space-x-2 md:space-x-3 group cursor-pointer">
-                <div className="relative w-8 h-8 flex items-center justify-center">
-                  {/* Dashed rotating ring */}
+                <div className="relative flex items-center justify-center">
+                  {/* Perply logo image */}
+                  <img src="/perply.png" alt="Perply" className="h-10 md:h-11 object-contain animate-pulse" />
+                  {/* ORIGINAL CODE (backup):
                   <div className="absolute inset-0 border-2 border-dashed border-neon-green/50 rounded-full animate-spin-slow"></div>
-                  {/* Inner solid ring rotating reverse */}
                   <div className="absolute inset-1 border border-neon-green/30 rounded-full animate-spin-slow" style={{ animationDirection: 'reverse', animationDuration: '15s' }}></div>
-                  {/* Pulsing lightning bolt */}
                   <Zap size={16} className="text-neon-green animate-pulse relative z-10" style={{ filter: 'drop-shadow(0 0 4px #39FF14)' }} />
+                  */}
                 </div>
                 
                 {/* Italic Styled Text */}
@@ -1850,6 +1848,14 @@ export default function App() {
                   </div>
                 </div>
               )}
+              <a
+                href="https://faucet.monad.xyz/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="h-8 px-2.5 md:px-3 rounded-sm border border-neon-blue/35 bg-neon-blue/10 text-[9px] md:text-[10px] font-mono uppercase tracking-[0.14em] md:tracking-[0.2em] text-neon-blue hover:bg-neon-blue/20 transition-all inline-flex items-center"
+              >
+                Faucet
+              </a>
               <button
                 onClick={() => setIsOnboardingOpen(true)}
                 className="h-8 px-2.5 md:px-3 rounded-sm border border-neon-yellow/35 bg-neon-yellow/10 text-[9px] md:text-[10px] font-mono uppercase tracking-[0.14em] md:tracking-[0.2em] text-neon-yellow hover:bg-neon-yellow/20 transition-all"
