@@ -42,7 +42,6 @@ const COINGECKO_CACHE_TTL_MS = 30_000;
 const COINGECKO_STALE_TTL_MS = 120_000;
 const LOG_LOOKBACK_BLOCKS = 90;
 const LIVE_PULSE_INTERVAL_MS = 1000;
-const LIVE_PULSE_MIN_WEI = 100_000_000_000_000n; // 0.0001 MON visual floor
 const LIVE_PULSE_MAX_HISTORY = 24;
 const SWAP_BASE_URL = (import.meta.env.VITE_MON_SWAP_URL as string | undefined)?.trim() ?? '';
 const TRACKED_WALLET_ASSETS = parseTrackedWalletAssets(import.meta.env.VITE_TRACKED_WALLET_ASSETS);
@@ -736,6 +735,8 @@ export default function App() {
     const projectedShort = baseShort + shortDelta;
 
     return {
+      longDelta: monFromWei(longDelta),
+      shortDelta: monFromWei(shortDelta),
       long: projectedLong > 0n ? monFromWei(projectedLong) : 0,
       short: projectedShort > 0n ? monFromWei(projectedShort) : 0
     };
@@ -1498,21 +1499,9 @@ export default function App() {
           faction = 'right';
           amountWei = deltaShortWei;
         }
-      } else if (projectedLongWei > 0n || projectedShortWei > 0n) {
-        if (projectedLongWei >= projectedShortWei) {
-          sideLabel = 'LONG';
-          faction = 'left';
-        } else {
-          sideLabel = 'SHORT';
-          faction = 'right';
-        }
-        amountWei = LIVE_PULSE_MIN_WEI;
       }
 
-      if (!sideLabel || !faction) return;
-      if (amountWei < LIVE_PULSE_MIN_WEI) {
-        amountWei = LIVE_PULSE_MIN_WEI;
-      }
+      if (!sideLabel || !faction || amountWei <= 0n) return;
 
       const amountMon = Number(ethers.formatEther(amountWei));
       const amount = new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 }).format(amountMon);
@@ -2110,6 +2099,9 @@ export default function App() {
                       {formatCurrency(projectedPoolLiquidity.long)}
                       <span className="text-[10px] md:text-xs ml-2 opacity-50" style={{ fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.05em' }}>$MON</span>
                     </span>
+                    <span className={`text-[8px] mt-1 font-mono ${projectedPoolLiquidity.longDelta >= 0 ? 'text-neon-green/80' : 'text-crimson-red/80'}`}>
+                      Floating Δ: {projectedPoolLiquidity.longDelta >= 0 ? '+' : ''}{formatAmount(projectedPoolLiquidity.longDelta, 4)} MON
+                    </span>
                     <span className="text-[8px] mt-1 text-neon-green/80 font-mono">
                       Congestion Bonus Earned: +{formatCurrency(longCongestionRewards)} MON
                     </span>
@@ -2140,6 +2132,9 @@ export default function App() {
                       {formatCurrency(projectedPoolLiquidity.short)}
                       <span className="text-[10px] md:text-xs ml-2 opacity-50" style={{ fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.05em' }}>$MON</span>
                     </span>
+                    <span className={`text-[8px] mt-1 font-mono ${projectedPoolLiquidity.shortDelta >= 0 ? 'text-neon-green/80' : 'text-crimson-red/80'}`}>
+                      Floating Δ: {projectedPoolLiquidity.shortDelta >= 0 ? '+' : ''}{formatAmount(projectedPoolLiquidity.shortDelta, 4)} MON
+                    </span>
                     <span className="text-[8px] mt-1 text-crimson-red/80 font-mono">
                       Congestion Bonus Earned: +{formatCurrency(shortCongestionRewards)} MON
                     </span>
@@ -2164,11 +2159,17 @@ export default function App() {
                 <div className="text-sm font-black text-neon-green font-mono">
                   {formatCurrency(projectedPoolLiquidity.long)} <span className="text-[9px] text-zinc-500">$MON</span>
                 </div>
+                <div className={`text-[8px] font-mono ${projectedPoolLiquidity.longDelta >= 0 ? 'text-neon-green/80' : 'text-crimson-red/80'}`}>
+                  Δ {projectedPoolLiquidity.longDelta >= 0 ? '+' : ''}{formatAmount(projectedPoolLiquidity.longDelta, 4)}
+                </div>
               </div>
               <div className="rounded-lg border border-crimson-red/25 bg-black/70 backdrop-blur-sm px-2.5 py-2 text-right">
                 <div className="text-[8px] uppercase tracking-[0.18em] text-crimson-red/80 font-bold">Short Pool</div>
                 <div className="text-sm font-black text-crimson-red font-mono">
                   {formatCurrency(projectedPoolLiquidity.short)} <span className="text-[9px] text-zinc-500">$MON</span>
+                </div>
+                <div className={`text-[8px] font-mono ${projectedPoolLiquidity.shortDelta >= 0 ? 'text-neon-green/80' : 'text-crimson-red/80'}`}>
+                  Δ {projectedPoolLiquidity.shortDelta >= 0 ? '+' : ''}{formatAmount(projectedPoolLiquidity.shortDelta, 4)}
                 </div>
               </div>
             </div>
