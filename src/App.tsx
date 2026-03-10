@@ -50,6 +50,7 @@ const PRECISION_E18 = 1_000_000_000_000_000_000n;
 
 let cachedCoingeckoPrice: number | null = null;
 let cachedCoingeckoAt = 0;
+let coingeckoProxyUnavailable = false;
 
 interface PriceAggregate {
   price: number;
@@ -214,22 +215,46 @@ async function fetchCoingeckoPrice(): Promise<number | null> {
     return cachedCoingeckoPrice;
   }
   try {
-    const data = await fetchJsonWithTimeout('/api/market/coingecko') as {
-      ok?: boolean;
-      price?: number;
-    } | null;
-    if (!data) {
-      if (cachedCoingeckoPrice !== null && now - cachedCoingeckoAt < COINGECKO_STALE_TTL_MS) {
-        return cachedCoingeckoPrice;
+    if (!coingeckoProxyUnavailable) {
+      const controller = new AbortController();
+      const timer = globalThis.setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+      try {
+        const response = await fetch('/api/market/coingecko', { signal: controller.signal });
+        if (response.status === 404) {
+          coingeckoProxyUnavailable = true;
+        } else if (response.ok) {
+          const data = await response.json() as {
+            ok?: boolean;
+            price?: number;
+          };
+          if (data.ok === true) {
+            const price = Number(data.price);
+            if (Number.isFinite(price) && price > 0) {
+              cachedCoingeckoPrice = price;
+              cachedCoingeckoAt = now;
+              return price;
+            }
+          }
+        }
+      } finally {
+        globalThis.clearTimeout(timer);
       }
-      return null;
     }
-    if (data.ok !== true) return null;
-    const price = Number(data.price);
-    if (!Number.isFinite(price) || price <= 0) return null;
-    cachedCoingeckoPrice = price;
-    cachedCoingeckoAt = now;
-    return price;
+
+    const direct = await fetchJsonWithTimeout(
+      'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'
+    ) as { bitcoin?: { usd?: number } } | null;
+    const directPrice = Number(direct?.bitcoin?.usd);
+    if (Number.isFinite(directPrice) && directPrice > 0) {
+      cachedCoingeckoPrice = directPrice;
+      cachedCoingeckoAt = now;
+      return directPrice;
+    }
+
+    if (cachedCoingeckoPrice !== null && now - cachedCoingeckoAt < COINGECKO_STALE_TTL_MS) {
+      return cachedCoingeckoPrice;
+    }
+    return null;
   } catch {
     if (cachedCoingeckoPrice !== null && now - cachedCoingeckoAt < COINGECKO_STALE_TTL_MS) {
       return cachedCoingeckoPrice;
