@@ -130,6 +130,52 @@ contract PerplyArenaTest is Test {
         assertEq(shortPos.pnl, -_toInt256Safe(expectedGross), "short side pnl mismatch");
     }
 
+    function testLargeMoveCreatesPendingDebtAndCloseCannotEscapeLoss() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 10);
+
+        _deposit(bob, 10 ether);
+        _open(bob, SHORT, 1 ether, 10);
+
+        vm.warp(block.timestamp + arena.minSettlementInterval());
+        _settleSigned(150e8);
+
+        // raw transfer = 4.0, but per-tick realization capped to loser side margin * 30% = 0.3
+        assertEq(arena.sidePendingSettlementDebt(SHORT), 3.7 ether, "pending debt must track uncapped loss");
+
+        PerplyArena.PositionView memory shortPos = arena.getPosition(bob, SHORT);
+        PerplyArena.PositionView memory longPos = arena.getPosition(alice, LONG);
+        assertEq(shortPos.pnl, -_toInt256Safe(4 ether), "short side must take full raw loss immediately");
+        assertEq(longPos.pnl, _toInt256Safe(0.29997 ether), "long side should only receive capped realized payout");
+
+        uint256 badDebtBefore = arena.systemBadDebt();
+        _close(bob, SHORT);
+        assertGt(arena.systemBadDebt(), badDebtBefore, "closing losing side must not bypass pending loss");
+    }
+
+    function testPendingDebtContinuesRealizingOnLaterTicksWithoutNewPriceMove() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 10);
+
+        _deposit(bob, 10 ether);
+        _open(bob, SHORT, 1 ether, 10);
+
+        vm.warp(block.timestamp + arena.minSettlementInterval());
+        _settleSigned(150e8);
+        assertEq(arena.sidePendingSettlementDebt(SHORT), 3.7 ether, "first realization pending debt mismatch");
+
+        vm.warp(block.timestamp + arena.minSettlementInterval());
+        _settleSigned(150e8);
+
+        // second tick should drain another capped 0.3 from existing debt even with flat price
+        assertEq(arena.sidePendingSettlementDebt(SHORT), 3.4 ether, "second realization pending debt mismatch");
+
+        PerplyArena.PositionView memory longPos = arena.getPosition(alice, LONG);
+        PerplyArena.PositionView memory shortPos = arena.getPosition(bob, SHORT);
+        assertEq(longPos.pnl, _toInt256Safe(0.59994 ether), "long side should accumulate realized payout over ticks");
+        assertEq(shortPos.pnl, -_toInt256Safe(4 ether), "short side loss should remain locked after initial debt accrual");
+    }
+
     function testCloseFeeIsHalfPercentOfPositiveEquity() public {
         _deposit(alice, 10 ether);
         _open(alice, LONG, 1 ether, 10);

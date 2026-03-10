@@ -723,6 +723,29 @@ export default function App() {
     return (userPositions.long?.amount || 0) + (userPositions.short?.amount || 0);
   }, [userPositions]);
 
+  const projectedPoolLiquidity = useMemo(() => {
+    const baseLong = BigInt(settlementModel.longWeightWei);
+    const baseShort = BigInt(settlementModel.shortWeightWei);
+    const longAccDelta = BigInt(projectedSettlement.longAccDelta);
+    const shortAccDelta = BigInt(projectedSettlement.shortAccDelta);
+
+    const longDelta = (baseLong * longAccDelta) / PRECISION_E18;
+    const shortDelta = (baseShort * shortAccDelta) / PRECISION_E18;
+
+    const projectedLong = baseLong + longDelta;
+    const projectedShort = baseShort + shortDelta;
+
+    return {
+      long: projectedLong > 0n ? monFromWei(projectedLong) : 0,
+      short: projectedShort > 0n ? monFromWei(projectedShort) : 0
+    };
+  }, [
+    settlementModel.longWeightWei,
+    settlementModel.shortWeightWei,
+    projectedSettlement.longAccDelta,
+    projectedSettlement.shortAccDelta
+  ]);
+
   const mapOnchainPosition = (
     raw: {
       margin: bigint;
@@ -2084,11 +2107,14 @@ export default function App() {
                   <div className="flex flex-col">
                     <span className="text-[11px] font-mono text-neon-green uppercase tracking-[0.4em] mb-2">LONG POOL</span>
                     <span className="text-2xl md:text-4xl font-black text-neon-green" style={{ fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.02em' }}>
-                      {formatCurrency(allianceLiquidity)}
+                      {formatCurrency(projectedPoolLiquidity.long)}
                       <span className="text-[10px] md:text-xs ml-2 opacity-50" style={{ fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.05em' }}>$MON</span>
                     </span>
                     <span className="text-[8px] mt-1 text-neon-green/80 font-mono">
                       Congestion Bonus Earned: +{formatCurrency(longCongestionRewards)} MON
+                    </span>
+                    <span className="text-[8px] text-zinc-500 font-mono">
+                      Includes live floating PnL projection
                     </span>
                     <span className="text-[8px] text-zinc-500 font-mono">
                       Long-side surcharge now: {(longCongestionRateBps / 100).toFixed(2)}%
@@ -2111,11 +2137,14 @@ export default function App() {
                   <div className="flex flex-col items-end">
                     <span className="text-[11px] font-mono text-crimson-red uppercase tracking-[0.4em] mb-2">SHORT POOL</span>
                     <span className="text-2xl md:text-4xl font-black text-crimson-red" style={{ fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.02em' }}>
-                      {formatCurrency(syndicateLiquidity)}
+                      {formatCurrency(projectedPoolLiquidity.short)}
                       <span className="text-[10px] md:text-xs ml-2 opacity-50" style={{ fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.05em' }}>$MON</span>
                     </span>
                     <span className="text-[8px] mt-1 text-crimson-red/80 font-mono">
                       Congestion Bonus Earned: +{formatCurrency(shortCongestionRewards)} MON
+                    </span>
+                    <span className="text-[8px] text-zinc-500 font-mono">
+                      Includes live floating PnL projection
                     </span>
                     <span className="text-[8px] text-zinc-500 font-mono">
                       Short-side surcharge now: {(shortCongestionRateBps / 100).toFixed(2)}%
@@ -2133,13 +2162,13 @@ export default function App() {
               <div className="rounded-lg border border-neon-green/25 bg-black/70 backdrop-blur-sm px-2.5 py-2">
                 <div className="text-[8px] uppercase tracking-[0.18em] text-neon-green/80 font-bold">Long Pool</div>
                 <div className="text-sm font-black text-neon-green font-mono">
-                  {formatCurrency(allianceLiquidity)} <span className="text-[9px] text-zinc-500">$MON</span>
+                  {formatCurrency(projectedPoolLiquidity.long)} <span className="text-[9px] text-zinc-500">$MON</span>
                 </div>
               </div>
               <div className="rounded-lg border border-crimson-red/25 bg-black/70 backdrop-blur-sm px-2.5 py-2 text-right">
                 <div className="text-[8px] uppercase tracking-[0.18em] text-crimson-red/80 font-bold">Short Pool</div>
                 <div className="text-sm font-black text-crimson-red font-mono">
-                  {formatCurrency(syndicateLiquidity)} <span className="text-[9px] text-zinc-500">$MON</span>
+                  {formatCurrency(projectedPoolLiquidity.short)} <span className="text-[9px] text-zinc-500">$MON</span>
                 </div>
               </div>
             </div>
@@ -2272,8 +2301,8 @@ export default function App() {
             <BattleCanvas
               dominance={dominance}
               latestPnL={latestPnL}
-              allianceLiquidity={allianceLiquidity}
-              syndicateLiquidity={syndicateLiquidity}
+              allianceLiquidity={projectedPoolLiquidity.long}
+              syndicateLiquidity={projectedPoolLiquidity.short}
               trend={trend}
             />
 

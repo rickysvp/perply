@@ -15,6 +15,7 @@ contract PerplyArena {
         uint32 leverage;
         uint64 entryPriceE8;
         int256 entryAccPnlPerWeight;
+        int256 entryAccDebtPerWeight;
         bool isOpen;
     }
 
@@ -117,6 +118,8 @@ contract PerplyArena {
     uint256[2] public sideWeight;
     uint256[2] public sideMargin;
     int256[2] public accPnlPerWeight;
+    int256[2] public accDebtPerWeight;
+    uint256[2] public sidePendingSettlementDebt;
     uint256[2] public cumulativeCongestionRewards;
     QueuedRiskParams private queuedRiskParams;
     TimelockedAddressOperation private queuedOwnershipTransfer;
@@ -686,6 +689,7 @@ contract PerplyArena {
             leverage: leverage,
             entryPriceE8: _toUint64(markPriceE8),
             entryAccPnlPerWeight: accPnlPerWeight[side],
+            entryAccDebtPerWeight: accDebtPerWeight[side],
             isOpen: true
         });
 
@@ -807,23 +811,30 @@ contract PerplyArena {
         uint256 winnerNet = 0;
 
         if (newPriceE8 != oldPrice && sideWeight[SIDE_LONG] > 0 && sideWeight[SIDE_SHORT] > 0) {
-            winnerSide = newPriceE8 > oldPrice ? SIDE_LONG : SIDE_SHORT;
-            loserSide = winnerSide == SIDE_LONG ? SIDE_SHORT : SIDE_LONG;
+            uint8 priceWinnerSide = newPriceE8 > oldPrice ? SIDE_LONG : SIDE_SHORT;
+            uint8 priceLoserSide = priceWinnerSide == SIDE_LONG ? SIDE_SHORT : SIDE_LONG;
 
             matchedWeight = _min(sideWeight[SIDE_LONG], sideWeight[SIDE_SHORT]);
             uint256 rawTransfer = (matchedWeight * absDelta * settlementStrengthBps) / oldPrice / BPS;
-
-            uint256 capTransfer = (sideMargin[loserSide] * maxSettlementTransferBps) / BPS;
-            grossTransfer = _min(rawTransfer, capTransfer);
-
-            if (grossTransfer > 0) {
-                settlementFee = (grossTransfer * settlementFeeBps) / BPS;
-                winnerNet = grossTransfer - settlementFee;
-
-                _applySideDelta(winnerSide, _toInt256(winnerNet));
-                _applySideDelta(loserSide, -_toInt256(grossTransfer));
-                treasuryBalance += settlementFee;
+            if (rawTransfer > 0) {
+                _accruePendingSettlementDebt(priceLoserSide, rawTransfer);
             }
+        }
+
+        // Realize pending debt in capped batches from each debtor side.
+        (uint256 longGross, uint256 longFee, uint256 longNet) = _realizePendingDebtForSide(SIDE_LONG);
+        (uint256 shortGross, uint256 shortFee, uint256 shortNet) = _realizePendingDebtForSide(SIDE_SHORT);
+
+        grossTransfer = longGross + shortGross;
+        settlementFee = longFee + shortFee;
+        winnerNet = longNet + shortNet;
+
+        if (longGross > 0 && shortGross == 0) {
+            loserSide = SIDE_LONG;
+            winnerSide = SIDE_SHORT;
+        } else if (shortGross > 0 && longGross == 0) {
+            loserSide = SIDE_SHORT;
+            winnerSide = SIDE_LONG;
         }
 
         markPriceE8 = newPriceE8;
@@ -1073,7 +1084,8 @@ contract PerplyArena {
 
     function _positionPnl(Position memory pos, uint8 side) internal view returns (int256) {
         int256 deltaAcc = accPnlPerWeight[side] - pos.entryAccPnlPerWeight;
-        return (_toInt256(pos.weight) * deltaAcc) / PRECISION;
+        int256 deltaDebt = accDebtPerWeight[side] - pos.entryAccDebtPerWeight;
+        return (_toInt256(pos.weight) * (deltaAcc - deltaDebt)) / PRECISION;
     }
 
     function _validateRiskParams(
@@ -1205,6 +1217,35 @@ contract PerplyArena {
 
         int256 perWeight = (amount * PRECISION) / _toInt256(weight);
         accPnlPerWeight[side] += perWeight;
+    }
+
+    function _accruePendingSettlementDebt(uint8 debtorSide, uint256 amount) internal {
+        if (amount == 0) return;
+        uint256 weight = sideWeight[debtorSide];
+        if (weight == 0) return;
+
+        int256 perWeightDebt = (_toInt256(amount) * PRECISION) / _toInt256(weight);
+        accDebtPerWeight[debtorSide] += perWeightDebt;
+        sidePendingSettlementDebt[debtorSide] += amount;
+    }
+
+    function _realizePendingDebtForSide(uint8 debtorSide)
+        internal
+        returns (uint256 grossTransfer, uint256 settlementFee, uint256 winnerNet)
+    {
+        uint256 debt = sidePendingSettlementDebt[debtorSide];
+        if (debt == 0) return (0, 0, 0);
+
+        uint256 capTransfer = (sideMargin[debtorSide] * maxSettlementTransferBps) / BPS;
+        grossTransfer = _min(debt, capTransfer);
+        if (grossTransfer == 0) return (0, 0, 0);
+
+        settlementFee = (grossTransfer * settlementFeeBps) / BPS;
+        winnerNet = grossTransfer - settlementFee;
+
+        sidePendingSettlementDebt[debtorSide] = debt - grossTransfer;
+        _applySideDelta(_opposite(debtorSide), _toInt256(winnerNet));
+        treasuryBalance += settlementFee;
     }
 
     function _coverBadDebt(uint256 debt) internal {
