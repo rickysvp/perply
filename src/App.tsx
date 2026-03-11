@@ -1006,22 +1006,7 @@ export default function App() {
         }
         setWalletError(diagMessage);
         pushReadErrorNotice(diagMessage);
-        setUserBalance(DEFAULT_BALANCE);
-        setUserAvailableWei(0n);
-        setUserPositions({ long: null, short: null });
-        setOnchainMarkPrice(null);
-        setOnchainMarkPriceE8(null);
-        setAllianceLiquidity(0);
-        setSyndicateLiquidity(0);
-        setSettlementModel(prev => ({
-          ...prev,
-          longWeightWei: 0n,
-          shortWeightWei: 0n,
-          longMarginWei: 0n,
-          shortMarginWei: 0n
-        }));
-        setRecentSettlements([]);
-        setRecentCongestionFees([]);
+        // Keep the last known snapshot on transient RPC/provider failures.
         return;
       }
 
@@ -1059,9 +1044,6 @@ export default function App() {
       if (markPriceResult.status === 'fulfilled') {
         setOnchainMarkPrice(fromPriceE8(markPriceResult.value));
         setOnchainMarkPriceE8(markPriceResult.value);
-      } else {
-        setOnchainMarkPrice(null);
-        setOnchainMarkPriceE8(null);
       }
       setLongCongestionRateBps(Number(congestionRates[0]));
       setShortCongestionRateBps(Number(congestionRates[1]));
@@ -1083,9 +1065,10 @@ export default function App() {
       await refreshArenaHistory(readProvider, readContract);
       setWalletError(null);
     } catch (error) {
-      setWalletError(toReadableError(error, 'Failed to load on-chain state'));
-      setOnchainMarkPrice(null);
-      setOnchainMarkPriceE8(null);
+      const readable = toReadableError(error, 'Failed to load on-chain state');
+      setWalletError(readable);
+      pushReadErrorNotice(readable);
+      // Keep last known mark/model on temporary failures.
     }
   };
 
@@ -1276,7 +1259,7 @@ export default function App() {
     setIsWalletPickerOpen(true);
     setConnectingWalletKey(null);
     if (wallets.length === 0) {
-      setWalletError('No EVM wallet detected. Install MetaMask / OKX / Rabby / Binance / Backpack / Phantom');
+      setWalletError('No supported EVM wallet detected. Install OKX / Phantom / Backpack');
       pushNotice('error', 'No injected EVM wallet detected in browser.');
       return;
     }
@@ -1319,23 +1302,7 @@ export default function App() {
       const wallets = await discoverWallets();
       if (!active) return;
       setWalletOptions(wallets);
-      for (const wallet of wallets) {
-        try {
-          const result = await wallet.provider.request({ method: 'eth_accounts' });
-          const accounts = Array.isArray(result) ? result as string[] : [];
-          if (accounts.length > 0) {
-            setWalletProvider(wallet.provider);
-            setConnectedWalletName(wallet.name);
-            setWalletAddress(accounts[0]);
-            setWalletError(null);
-            void refreshOnchainState(accounts[0]);
-            void refreshWalletBalances(accounts[0]);
-            break;
-          }
-        } catch {
-          // ignore passive wallet detection errors
-        }
-      }
+      // Avoid passive eth_accounts probing across injected wallets; some providers reject unknown origins noisily.
     };
     void detect();
     return () => {
