@@ -106,6 +106,8 @@ contract PerplyArena {
     uint16 public maintenanceLeverageBps;
     uint16 public liquidationPenaltyBps;
     uint16 public liquidatorRewardShareBps;
+    uint16 public minSettlementFloorBps;
+    uint256 public minSettlementFloorAbsolute;
 
     uint256 public treasuryBalance;
     uint256 public insuranceFund;
@@ -249,6 +251,7 @@ contract PerplyArena {
     event InsuranceWithdrawn(address indexed to, uint256 amount);
     event InsuranceFunded(address indexed sender, uint256 amount, uint256 remainingBadDebt);
     event BadDebtRecorded(uint256 uncoveredDebt, uint256 totalBadDebt);
+    event SettlementFloorUpdated(uint256 minSettlementFloorAbsolute, uint16 minSettlementFloorBps);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
@@ -298,6 +301,9 @@ contract PerplyArena {
         maintenanceLeverageBps = 40; // +0.4% * leverage
         liquidationPenaltyBps = 200; // 2%
         liquidatorRewardShareBps = 5000; // 50% of penalty to liquidator
+
+        minSettlementFloorAbsolute = 0.01 ether; // 0.01 MON absolute floor
+        minSettlementFloorBps = 1; // 0.01% of matched weight
     }
 
     receive() external payable {
@@ -428,6 +434,14 @@ contract PerplyArena {
         if (newDelaySec < 1 hours || newDelaySec > 7 days) revert InvalidAmount();
         adminOpsTimelockSec = newDelaySec;
         emit AdminOpsTimelockUpdated(newDelaySec);
+    }
+
+    function setSettlementFloor(uint256 newMinSettlementFloorAbsolute, uint16 newMinSettlementFloorBps) external onlyOwner {
+        if (newMinSettlementFloorAbsolute > 100 ether) revert InvalidAmount();
+        if (newMinSettlementFloorBps > 1000) revert InvalidAmount();
+        minSettlementFloorAbsolute = newMinSettlementFloorAbsolute;
+        minSettlementFloorBps = newMinSettlementFloorBps;
+        emit SettlementFloorUpdated(newMinSettlementFloorAbsolute, newMinSettlementFloorBps);
     }
 
     function setPaused(bool newPaused) external {
@@ -1240,6 +1254,12 @@ contract PerplyArena {
         grossTransfer = _min(debt, capTransfer);
         if (grossTransfer == 0) return (0, 0, 0);
 
+        uint256 matchedWeight = _min(sideWeight[SIDE_LONG], sideWeight[SIDE_SHORT]);
+        uint256 floorByWeight = (matchedWeight * minSettlementFloorBps) / BPS;
+        uint256 rawFloor = _max(minSettlementFloorAbsolute, floorByWeight);
+        uint256 effectiveFloor = _min(rawFloor, capTransfer);
+        if (debt < effectiveFloor) return (0, 0, 0);
+
         settlementFee = (grossTransfer * settlementFeeBps) / BPS;
         winnerNet = grossTransfer - settlementFee;
 
@@ -1288,6 +1308,10 @@ contract PerplyArena {
 
     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a <= b ? a : b;
+    }
+
+    function _max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a >= b ? a : b;
     }
 
     function _opposite(uint8 side) internal pure returns (uint8) {

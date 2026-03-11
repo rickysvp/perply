@@ -176,6 +176,27 @@ contract PerplyArenaTest is Test {
         assertEq(shortPos.pnl, -_toInt256Safe(4 ether), "short side loss should remain locked after initial debt accrual");
     }
 
+    function testSettlementFloorAccumulatesSmallMovesUntilTriggered() public {
+        _deposit(alice, 10 ether);
+        _open(alice, LONG, 1 ether, 10);
+
+        _deposit(bob, 10 ether);
+        _open(bob, SHORT, 1 ether, 10);
+
+        // Force a visible floor so one small move is insufficient.
+        arena.setSettlementFloor(0.05 ether, 0);
+
+        _advanceAndSettle(100.5e8); // ~0.04 ether raw transfer, below floor
+        assertEq(arena.sidePendingSettlementDebt(SHORT), 0.04 ether, "small move should accumulate pending debt");
+        PerplyArena.PositionView memory longAfterFirst = arena.getPosition(alice, LONG);
+        assertEq(longAfterFirst.pnl, 0, "winner should not receive payout before floor is reached");
+
+        _advanceAndSettle(101e8); // adds more debt, should now trigger realization
+        assertEq(arena.sidePendingSettlementDebt(SHORT), 0, "pending debt should be realized once floor is crossed");
+        PerplyArena.PositionView memory longAfterSecond = arena.getPosition(alice, LONG);
+        assertGt(longAfterSecond.pnl, 0, "winner should receive payout once floor threshold is reached");
+    }
+
     function testCloseFeeIsHalfPercentOfPositiveEquity() public {
         _deposit(alice, 10 ether);
         _open(alice, LONG, 1 ether, 10);
